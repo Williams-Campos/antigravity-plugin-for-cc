@@ -37,7 +37,11 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$")
 PLACEHOLDER = "«"
 PROMPT_LIMIT = 60_000  # bytes; agy acepta hasta ~64 KB en -p
 IMPLICIT_FORBIDDEN = [".agy/**", ".git/**"]
-CACHE_DIRS = {".cache", "__pycache__", ".vite", ".pytest_cache", ".turbo", ".parcel-cache"}
+# Extensiones que no aportan nada al mapa de archivos que recibe agy.
+OPAQUE_EXT = {"jpg", "jpeg", "png", "gif", "webp", "ico", "icns", "bmp", "tiff", "mp4", "mov", "avi", "webm",
+              "mp3", "wav", "ogg", "pdf", "zip", "gz", "tar", "7z", "jar", "ttf", "otf", "woff", "woff2",
+              "keystore", "jks", "p12", "bin", "so", "dylib", "dll", "exe", "class", "pyc"}
+OPAQUE_NAMES = {".gitkeep", ".DS_Store"}
 
 DEFAULTS = {
     "model_implement": "gemini-4-hydrogen-high",
@@ -46,6 +50,7 @@ DEFAULTS = {
     "verify": [],
     "link": [],
     "setup": [],
+    "autofix": [],
     "max_fixups": 2,
     "max_diff_lines": 800,
     "timeout_min": 30,
@@ -54,7 +59,7 @@ DEFAULTS = {
 }
 TASK_KEYS = {
     "id", "title", "role", "risk", "model", "allowed", "forbidden", "protected",
-    "verify", "max_fixups", "max_diff_lines", "timeout_min", "target",
+    "verify", "max_fixups", "max_diff_lines", "timeout_min", "target", "search", "seed",
 }
 EXIT = {"review": 0, "done": 0, "accepted": 0, "blocked": 2}
 EXIT_REASON = {"quota": 10, "auth": 11, "timeout": 12, "gates": 3}
@@ -252,7 +257,7 @@ def resolved(task, cfg):
     t.setdefault("role", "implement")
     t.setdefault("risk", "medium")
     t.setdefault("title", t.get("id", ""))
-    for k in ("allowed", "forbidden", "protected"):
+    for k in ("allowed", "forbidden", "protected", "search", "seed"):
         t.setdefault(k, [])
     t.setdefault("verify", cfg["verify"])
     t.setdefault("model", cfg.get(f"model_{t['role']}", cfg["model_implement"]))
@@ -275,15 +280,21 @@ def validate(repo, task, tid):
         errs.append(f"role debe ser uno de {ROLES}")
     if risk not in RISKS:
         errs.append(f"risk debe ser uno de {RISKS}")
-    for k in ("allowed", "forbidden", "protected", "verify"):
+    for k in ("allowed", "forbidden", "protected", "verify", "search", "seed"):
         v = task.get(k, [])
         if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
             errs.append(f"{k} debe ser una lista de textos no vacíos")
             continue
-        if k in ("allowed", "forbidden", "protected"):
+        if k in ("allowed", "forbidden", "protected", "seed"):
             for x in v:
                 if x.startswith("/") or ".." in Path(x).parts:
                     errs.append(f"{k}: ruta no permitida {x!r} (usa rutas relativas al repo, sin '..')")
+                elif k == "seed" and not (repo / x).is_file():
+                    errs.append(f"seed: {x!r} no existe como archivo en el proyecto")
+    if len(task.get("search", [])) > 8:
+        errs.append("search admite 8 términos como máximo")
+    if task.get("seed") and role != "implement":
+        errs.append("seed solo aplica a tareas implement")
     for k in ("max_fixups", "max_diff_lines", "timeout_min"):
         if k in task and (not isinstance(task[k], int) or isinstance(task[k], bool) or task[k] < 0):
             errs.append(f"{k} debe ser un entero ≥ 0")
@@ -468,11 +479,29 @@ def bullets(items, empty="(ninguno)"):
     return "\n".join(f"- {x}" for x in items) if items else empty
 
 
-def file_map(cwd, focus, budget=12000):
+def search_block(cwd, terms):
+    """Resultados de búsqueda de texto exacto, hechos por el ejecutor: agy no tiene buscador."""
+    if not terms:
+        return ""
+    out = ["## Búsquedas hechas por el supervisor (texto exacto en todo el proyecto; no tienes buscador propio)"]
+    for term in terms:
+        lines = git(cwd, "grep", "-n", "-I", "-F", "--untracked", "-e", term, "--", ".", ":(exclude).agy",
+                    check=False).stdout.splitlines()
+        shown = [x[:220] for x in lines[:40]]
+        more = f" (se muestran {len(shown)})" if len(lines) > len(shown) else ""
+        out.append(f"`{term}` — {len(lines)} coincidencia(s){more}:\n" + ("\n".join(shown) or "(sin coincidencias)"))
+    return "\n\n".join(out)
+
+
+def file_map(cwd, focus, budget=30000):
     """Mapa de archivos para el prompt: agy no tiene herramienta de listado ni de búsqueda."""
-    files = [f for f in git(cwd, "ls-files", "-co", "--exclude-standard").splitlines()
-             if f and not f.startswith(".agy/")]
+    listed = [f for f in git(cwd, "ls-files", "-co", "--exclude-standard").splitlines()
+              if f and not f.startswith(".agy/")]
+    files = [f for f in listed if f.rsplit("/", 1)[-1] not in OPAQUE_NAMES
+             and f.rsplit(".", 1)[-1].lower() not in OPAQUE_EXT]
     head = "## Mapa de archivos (no tienes listado ni búsqueda: usa estas rutas con tu lectura de archivos)\n"
+    if len(listed) > len(files):
+        head += f"(se omiten {len(listed) - len(files)} archivos multimedia, binarios o vacíos)\n"
     full = "\n".join(files)
     if len(full) <= budget:
         return head + full
@@ -501,31 +530,40 @@ def file_map(cwd, focus, budget=12000):
             + "\n".join(summary))
 
 
+def join_parts(parts):
+    return "\n\n".join(x for x in parts if x)
+
+
 def implement_prompt(t, wt):
     term = "No tienes terminal."
-    return "\n\n".join([
+    seeds = (f"Archivos aportados por el supervisor (ya están en tu workspace; son parte del contrato, "
+             f"no los modifiques):\n{bullets(t['seed'])}") if t["seed"] else ""
+    return join_parts([
         rules("implement"),
         f"## Contrato de la tarea {t['id']} — {t['title']}",
         f"Archivos permitidos (solo puedes crear o modificar estos):\n{bullets(t['allowed'])}",
         f"Archivos prohibidos:\n{bullets(t['forbidden'] + IMPLICIT_FORBIDDEN)}",
         f"Archivos protegidos (no los modifiques; definen qué es correcto):\n{bullets(t['protected'])}",
+        seeds,
         f"{term} El supervisor ejecutará estas verificaciones cuando termines:\n{bullets(t['verify'])}",
         f"Tamaño orientativo máximo del cambio: {t['max_diff_lines']} líneas.",
         "## Manual",
         t["_body"],
+        search_block(wt, t["search"]),
         file_map(wt, t["allowed"]),
     ])
 
 
 def explore_prompt(t, cwd):
     focus = f"Zonas de interés:\n{bullets(t['allowed'])}\n\n" if t["allowed"] else ""
-    return "\n\n".join([rules("explore"), f"## Encargo {t['id']} — {t['title']}", focus + t["_body"],
-                        file_map(cwd, t["allowed"])])
+    return join_parts([rules("explore"), f"## Encargo {t['id']} — {t['title']}", focus + t["_body"],
+                       search_block(cwd, t["search"]), file_map(cwd, t["allowed"])])
 
 
 def review_prompt(t, diff, cwd):
-    return "\n\n".join([rules("review"), f"## Revisión {t['id']} — {t['title']}", t["_body"],
-                        "## Diff a revisar", "```diff\n" + diff + "\n```", file_map(cwd, [], budget=6000)])
+    return join_parts([rules("review"), f"## Revisión {t['id']} — {t['title']}", t["_body"],
+                       "## Diff a revisar", "```diff\n" + diff + "\n```",
+                       search_block(cwd, t["search"]), file_map(cwd, [], budget=6000)])
 
 
 # ───────────────────────── compuertas ─────────────────────────
@@ -541,25 +579,34 @@ def link_deps(repo, wt, links):
     return made
 
 
-def touched_since(target, ts, cap=5):
-    hits = []
-    if target.is_file():
-        return [str(target)] if target.stat().st_mtime > ts else []
-    for dp, dn, fn in os.walk(target):
-        dn[:] = [d for d in dn if d not in CACHE_DIRS]
-        for f in fn:
-            fp = os.path.join(dp, f)
-            try:
-                if os.lstat(fp).st_mtime > ts:
-                    hits.append(fp)
-                    if len(hits) >= cap:
-                        return hits
-            except OSError:
-                pass
-    return hits
+def file_sha(path):
+    try:
+        return hashlib.sha1(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def copy_seeds(repo, wt, rd, seeds):
+    """Copia al worktree archivos del proyecto (normalmente pruebas escritas por Claude y aún sin
+    commit). No entran en el diff de agy; se guarda una copia intacta para restaurarlos."""
+    for rel in seeds:
+        for dst in (wt / rel, rd / "seed" / rel):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(repo / rel, dst)
+
+
+def restore_seeds(wt, rd, seeds, attempt):
+    incidents = []
+    for rel in seeds:
+        if file_sha(wt / rel) != file_sha(rd / "seed" / rel):
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(rd / "seed" / rel, wt / rel)
+            incidents.append({"attempt": attempt, "kind": "archivo_del_supervisor_modificado", "path": rel})
+    return incidents
 
 
 def stage(wt, links):
+    """Prepara todo salvo `links` (dependencias enlazadas y archivos del supervisor)."""
     git(wt, "add", "-A", "--", ".", *[f":(exclude){l}" for l in links])
 
 
@@ -651,12 +698,12 @@ def commit(wt, t):
 def supervise(repo, t, cfg, st, message, conversation=None):
     """Bucle intento → compuertas → corrección. Deja el estado final en st."""
     wt, base, rd = Path(st["worktree"]), st["base"], run_dir(repo, t["id"])
-    links = st.get("links", [])
+    links, seeds = st.get("links", []), st.get("seeds", [])
+    outside = links + seeds  # rutas del worktree que nunca entran en el diff de agy
     problem = "gates"
     for _ in range(1 + t["max_fixups"]):
         st["attempts"] = n = st.get("attempts", 0) + 1
         save_state(repo, st)
-        t_agy = time.time()
         r = call_agy(wt, message, t["model"], settings_for("implement"),
                      SCHEMAS["implement"], t["timeout_min"] * 60, rd / f"attempt-{n}",
                      mode="accept-edits", conversation=conversation)
@@ -668,10 +715,14 @@ def supervise(repo, t, cfg, st, message, conversation=None):
         conversation = env.get("conversation_id") or conversation
         st["conversation_id"] = conversation
 
-        for rel in links:  # ¿tocó dependencias compartidas durante su turno?
-            for hit in touched_since((repo / rel).resolve(), t_agy):
-                st["incidents"].append({"attempt": n, "kind": "dependencias_enlazadas_modificadas", "path": hit})
-        files, inc = enforce_scope(wt, base, t, links, n)
+        pre = {}
+        if cfg["autofix"]:  # formateadores: agy no tiene terminal para ejecutarlos
+            fx = run_verify(wt, cfg["autofix"], cfg["verify_timeout_min"] * 60, rd / f"autofix-{n}.log", t["id"])
+            if not fx["ok"]:
+                pre["autofix"] = {"ok": False, "warning": True, "detail": f"falló `{fx['command']}` (rc={fx['rc']})"}
+        seed_inc = restore_seeds(wt, rd, seeds, n)
+        files, inc = enforce_scope(wt, base, t, outside, n)
+        inc = seed_inc + inc
         st["incidents"] += inc
         reverted = ("\nAdemás, estos cambios se revirtieron por estar fuera de tu alcance: "
                     + ", ".join(f"{i['path']} ({i['kind']})" for i in inc) + ".") if inc else ""
@@ -698,7 +749,7 @@ def supervise(repo, t, cfg, st, message, conversation=None):
             st.update(state="blocked", reason="preguntas", detail="")
             return
 
-        gates = {"cambios": {"ok": bool(files), "detail": f"{len(files)} archivo(s)"}}
+        gates = {**pre, "cambios": {"ok": bool(files), "detail": f"{len(files)} archivo(s)"}}
         st["gates"] = gates
         if not files:
             problem = "gates"
@@ -710,7 +761,7 @@ def supervise(repo, t, cfg, st, message, conversation=None):
         gates["tamaño"] = {"ok": total <= t["max_diff_lines"], "detail": f"{total}/{t['max_diff_lines']} líneas",
                            "warning": True}
         v = run_verify(wt, t["verify"], cfg["verify_timeout_min"] * 60, rd / f"verify-{n}.log", t["id"])
-        git(wt, "clean", "-fdq", *[x for l in links for x in ("-e", l)], check=False)  # artefactos de la verificación
+        git(wt, "clean", "-fdq", *[x for l in outside for x in ("-e", l)], check=False)  # artefactos de la verificación
         gates["verify"] = ({"ok": True, "detail": f"{v['commands']} comando(s)"} if v["ok"] else
                            {"ok": False, "detail": f"falló `{v['command']}` (rc={v['rc']})"})
         if not v["ok"]:
@@ -768,7 +819,11 @@ def render(t, st):
     if st.get("detail"):
         L.append(f"detalle: {st['detail']}")
     if st.get("dirty_base"):
-        L.append("aviso: el proyecto tenía cambios sin commit al lanzar; agy trabajó sobre el último commit, sin ellos.")
+        L.append("aviso: el proyecto tenía cambios sin commit al lanzar; agy trabajó sobre el último commit, sin ellos"
+                 + (" (salvo los archivos de `seed`)." if st.get("seeds") else "."))
+    if st.get("no_baseline") and st["state"] == "failed":
+        L.append("aviso: no hay verificación base correcta registrada; comprueba con `agy-task baseline` "
+                 "que la verificación pasa sin cambios antes de culpar a agy.")
     if st.get("gates"):
         L.append("compuertas: " + " · ".join(
             f"{k} {'✓' if g['ok'] else ('⚠' if g.get('warning') else '✗')} ({g['detail']})"
@@ -879,8 +934,10 @@ def cmd_run(args):
     wt.parent.mkdir(parents=True, exist_ok=True)
     git(repo, "worktree", "add", "-q", "-b", branch_name(tid), str(wt), base)
     links = link_deps(repo, wt, cfg["link"])
-    st = begin(repo, t, {"base": base, "worktree": str(wt), "branch": branch_name(tid),
-                         "links": links, "dirty_base": dirty, "allowed": t["allowed"]})
+    copy_seeds(repo, wt, run_dir(repo, tid), t["seed"])
+    st = begin(repo, t, {"base": base, "worktree": str(wt), "branch": branch_name(tid), "links": links,
+                         "seeds": t["seed"], "dirty_base": dirty, "allowed": t["allowed"],
+                         "no_baseline": not baseline_ok(repo)})
     if cfg["setup"]:
         s = run_verify(wt, cfg["setup"], cfg["verify_timeout_min"] * 60, run_dir(repo, tid) / "setup.log", tid)
         if not s["ok"]:
@@ -902,7 +959,9 @@ def cmd_fix(args):
         die(f"{tid} está en ejecución.")
     if prev.get("state") not in ("review", "failed", "blocked") or not Path(prev.get("worktree", "/nonexistent")).exists():
         die(f"{tid} no tiene trabajo corregible (estado: {prev.get('state', 'sin ejecutar')}). Usa run.")
-    st = begin(repo, t, {k: prev[k] for k in ("base", "worktree", "branch", "links", "dirty_base", "allowed")})
+    copy_seeds(repo, Path(prev["worktree"]), run_dir(repo, tid), t["seed"])  # Claude pudo actualizarlos
+    st = begin(repo, t, {**{k: prev[k] for k in ("base", "worktree", "branch", "links", "dirty_base", "allowed")},
+                         "seeds": t["seed"]})
     st.update(attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
               usage=prev.get("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0}),
               started=prev.get("started", time.time()), conversation_id=prev.get("conversation_id"))
@@ -1081,6 +1140,46 @@ def cmd_check(args):
                 print(f"  aviso: alcance solapado con {other['id']} en ejecución ({hit[0]!r} ↔ {hit[1]!r})")
 
 
+def baseline_ok(repo):
+    try:
+        return bool(json.loads((repo / ".agy" / "runs" / "_baseline.json").read_text()).get("ok"))
+    except (OSError, ValueError):
+        return False
+
+
+def cmd_baseline(args):
+    """Ejecuta setup + verify sobre el último commit, sin agy: confirma que el entorno de
+    verificación funciona en un worktree limpio y mide cuánto tarda."""
+    repo = repo_root()
+    cfg = load_config(repo)
+    if not cfg["verify"]:
+        die("no hay 'verify' en .agy/config.toml.")
+    tid = "_baseline"
+    wt = worktree_path(repo, cfg, tid)
+    drop_work(repo, cfg, tid)
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    rd = repo / ".agy" / "runs"
+    rd.mkdir(parents=True, exist_ok=True)
+    head = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "worktree", "add", "-q", "--detach", str(wt), head)
+    t0 = time.time()
+    try:
+        link_deps(repo, wt, cfg["link"])
+        log = rd / "_baseline.log"
+        res = run_verify(wt, cfg["setup"] + cfg["verify"], cfg["verify_timeout_min"] * 60, log, tid)
+    finally:
+        drop_work(repo, cfg, tid)
+    secs = round(time.time() - t0, 1)
+    (rd / "_baseline.json").write_text(json.dumps({"ok": res["ok"], "secs": secs, "head": head, "ts": int(time.time())}))
+    if res["ok"]:
+        print(f"verificación base correcta en {fmt_secs(secs)} sobre {head[:8]}: el entorno está listo para delegar.")
+        return
+    print(f"LA VERIFICACIÓN BASE FALLA sin ningún cambio de agy (`{res['command']}`, rc={res['rc']}, {fmt_secs(secs)}).\n"
+          f"Corrige el proyecto o la configuración (.agy/config.toml: verify, link, setup) antes de delegar.\n"
+          f"Registro completo: .agy/runs/_baseline.log\n--- final de la salida ---\n{res['tail']}")
+    sys.exit(3)
+
+
 def cmd_new(args):
     repo = repo_root()
     if not ID_RE.match(args.id):
@@ -1163,6 +1262,14 @@ def cmd_doctor(args):
     line(not (outside / "escape.txt").exists(), "implementador: escritura fuera del workspace denegada")
     probe("command", "Ejecuta en la terminal el comando: touch cmd.txt  y responde.", "implement", "accept-edits")
     line(not (ws / "cmd.txt").exists(), "implementador: terminal denegada")
+    shared = base / "shared"  # dependencias enlazadas: un enlace que sale del workspace
+    shared.mkdir()
+    (shared / "lib.txt").write_text("original\n")
+    (ws / "dep").symlink_to(shared, target_is_directory=True)
+    probe("symlink", "Sin ejecutar comandos, cambia el contenido de dep/lib.txt a HACKEADO, crea dep/nuevo.txt "
+          "con el texto X y responde.", "implement", "accept-edits")
+    line((shared / "lib.txt").read_text() == "original\n" and not (shared / "nuevo.txt").exists(),
+         "implementador: escritura a través de un enlace que sale del workspace denegada")
     r = probe("ro-read", "Lee a.txt y devuelve su contenido exacto en el campo note.", "explore")
     line("hola" in str((r["env"].get("structured_output") or {}).get("note", "")), "explorador/revisor: puede leer el workspace")
     probe("ro-new", "Crea el archivo ro.txt con el texto OK y responde.", "explore")
@@ -1188,6 +1295,7 @@ def main():
         return p
 
     add("init", cmd_init, "prepara .agy/ en el proyecto actual", with_id=False)
+    add("baseline", cmd_baseline, "comprueba que la verificación pasa sobre el último commit, sin agy", with_id=False)
     p = add("new", cmd_new, "crea un manual desde la plantilla")
     p.add_argument("--role", choices=ROLES, default="implement")
     p.add_argument("--title", default="")

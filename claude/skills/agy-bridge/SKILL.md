@@ -18,7 +18,7 @@ Tú (Claude) eres la cabeza: decides, especificas y aceptas. agy es el trabajado
 
 ## Flujo
 
-1. `agy-task init` (una vez por proyecto). Confirma con el usuario el comando de verificación y ponlo en `.agy/config.toml` (`verify`, y `link` para dependencias como `node_modules`).
+1. Una vez por proyecto: `agy-task init`, y completa `.agy/config.toml` con el comando de verificación del proyecto (`verify`), las rutas que git no copia (`link`: dependencias, SDK local) y el formateador (`autofix`). Después `agy-task baseline`: comprueba, sin gastar cuota de agy, que la verificación pasa en un worktree limpio. Si falla, nada de lo que delegues podrá pasar.
 2. `agy-task new <ID> --role implement|explore|review --title "..."` y **rellena el manual** en `.agy/tasks/<ID>.md`.
 3. `agy-task check <ID>` hasta que sea válido.
 4. `agy-task run <ID>`. Si puede tardar más de 2 minutos, ejecútalo en segundo plano (Bash con `run_in_background`) y sigue con otra cosa; no hagas polling.
@@ -29,9 +29,10 @@ Tú (Claude) eres la cabeza: decides, especificas y aceptas. agy es el trabajado
 El manual es la única información que agy tiene. Lo que no decidas tú, lo decide agy.
 
 - **Objetivo**: comportamiento observable, no pasos.
-- **Contexto**: rutas exactas que debe leer y el patrón existente que debe imitar. agy no tiene búsqueda ni listado: solo recibe un mapa de rutas.
+- **Contexto**: rutas exactas que debe leer y el patrón existente que debe imitar. agy no tiene búsqueda ni listado: recibe un mapa de rutas y los resultados de los términos que pongas en `search` (texto exacto, p. ej. el nombre de una clase).
 - **Cómo hacerlo**: todas las decisiones de diseño ya tomadas (firmas, nombres, librerías permitidas).
-- **Criterios de aceptación**: verificables. Lo ideal es escribir tú primero los tests, ponerlos en `protected` y que `verify` los ejecute: así el contrato es ejecutable.
+- **Criterios de aceptación**: verificables, con valores concretos. Lo ideal es escribir tú primero las pruebas y listarlas en `seed`: agy las recibe aunque no tengan commit, no puede modificarlas y no entran en su diff. Así el contrato es ejecutable.
+- Si no estás seguro de un valor esperado, dilo en el manual y pide `blocked` en caso de discrepancia, en vez de dejar que agy lo "arregle".
 - **allowed** lo más estrecho posible; **risk** honesto.
 - Una tarea = un cambio coherente. Si no puedes escribir criterios verificables, no la delegues.
 
@@ -48,10 +49,19 @@ El manual es la única información que agy tiene. Lo que no decidas tú, lo dec
 
 `accept` deja los cambios **preparados (staged) sin commit** en la rama actual. El commit sigue las reglas normales del usuario.
 
+Cada tarea se verifica sola, en su worktree. Después de aceptar varias tareas, ejecuta una vez la verificación del proyecto sobre el conjunto antes de dar el trabajo por bueno.
+
+## Patrones que rinden
+
+- **Explorar antes de especificar**: un `explore` (20–60 s) te da rutas, líneas y huecos con los que escribir un manual preciso sin leer tú el código. Comprueba dos o tres de sus referencias antes de fiarte.
+- **Paralelo**: lanza a la vez las tareas independientes (cada una en segundo plano). La verificación domina el tiempo, no agy.
+- **Revisión cruzada**: tras un `implement`, un `review` con `target = "<ID>"` usa otro modelo y cuesta ~1 minuto. Si encuentra algo real, pásaselo a agy con `fix`.
+- **Contrato ejecutable**: escribe tú la prueba, ponla en `seed` y deja que agy implemente hasta que pase.
+
 ## Comandos
 
 ```
-agy-task init | status | doctor [--probe]
+agy-task init | baseline | status | doctor [--probe]
 agy-task new <ID> --role R --title "..." [--target <ID>|working]
 agy-task check|run|result|cancel <ID>      run: --restart, --allow-overlap
 agy-task fix <ID> "mensaje para agy"

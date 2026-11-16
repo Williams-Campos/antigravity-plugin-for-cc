@@ -183,21 +183,22 @@ class Implement(Base):
         self.assertEqual(self.state("T9")["state"], "rejected")
         self.assertEqual(self.git("status", "--porcelain", "--", "src").strip(), "")
 
-    def test_links_and_tamper_detection(self):
+    def test_linked_dependencies_stay_out_of_the_diff(self):
+        # git no copia lo ignorado (dependencias, SDK): se enlaza y nunca entra en el diff de agy.
         (self.repo / "deps").mkdir()
         (self.repo / "deps" / "lib.py").write_text("x = 1\n")
         (self.repo / ".gitignore").write_text("deps/\n")
         self.git("add", ".gitignore")
         self.git("commit", "-qm", "ignore")
-        (self.repo / ".agy" / "config.toml").write_text(f"verify = ['''{VERIFY}''']\nlink = ['deps']\n")
+        (self.repo / ".agy" / "config.toml").write_text(f"verify = [\'\'\'{VERIFY}\'\'\', 'test -f deps/lib.py']\nlink = ['deps']\n")
         self.task("T10")
-        self.plan({"write": {"src/calc.py": GOOD, "deps/lib.py": "x = 2\n"}, "so": DONE})
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
         self.cli("run", "T10")
         st = self.state("T10")
         self.assertEqual(st["links"], ["deps"])
-        self.assertEqual([i["kind"] for i in st["incidents"]], ["dependencias_enlazadas_modificadas"])
-        self.assertEqual([f["path"] for f in st["files"]], ["src/calc.py"])  # el enlace no entra al diff
-        self.assertEqual(st["review_level"], "diff")
+        self.assertEqual(st["incidents"], [])
+        self.assertEqual([f["path"] for f in st["files"]], ["src/calc.py"])
+        self.assertEqual(st["review_level"], "resumen")
 
     def test_accept_conflict_leaves_project_intact(self):
         self.task("T11")
@@ -207,6 +208,68 @@ class Implement(Base):
         self.cli("accept", "T11", code=3)
         self.assertIn("cambio local", (self.repo / "src" / "calc.py").read_text())
         self.assertEqual(self.state("T11")["state"], "review")
+
+    def test_seed_files_reach_agy_but_stay_out_of_the_diff(self):
+        # Claude escribe la prueba primero y no la confirma: agy debe verla, no puede cambiarla,
+        # y no forma parte de lo que agy entrega.
+        seed = self.repo / "tests" / "test_add.py"
+        seed.write_text("import sys; sys.path.insert(0, 'src')\nimport calc\nassert calc.add(2, 3) == 5\n")
+        (self.repo / ".agy" / "config.toml").write_text("verify = ['python3 tests/test_add.py']\n")
+        self.task("S1", extra='allowed = ["src/**"]\nseed = ["tests/test_add.py"]\n')
+        self.plan({"write": {"src/calc.py": BAD, "tests/test_add.py": "assert True\n"}, "so": DONE},
+                  {"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.cli("run", "S1")
+        st = self.state("S1")
+        self.assertEqual((st["state"], st["attempts"]), ("review", 2))
+        self.assertEqual([(i["kind"], i["path"]) for i in st["incidents"]],
+                         [("archivo_del_supervisor_modificado", "tests/test_add.py")])
+        self.assertEqual([f["path"] for f in st["files"]], ["src/calc.py"])
+        self.assertIn("tests/test_add.py", self.calls()[0]["argv"][-1])
+        self.cli("accept", "S1", "--reviewed")
+        self.assertEqual(self.git("diff", "--cached", "--name-only").split(), ["src/calc.py"])
+        self.assertIn("calc.add(2, 3) == 5", seed.read_text())  # la prueba de Claude sigue intacta
+
+    def test_seed_must_exist(self):
+        self.task("S2", extra='allowed = ["src/**"]\nseed = ["tests/nope.py"]\n')
+        self.assertIn("no existe como archivo", self.cli("check", "S2", code=1))
+
+    def test_autofix_runs_before_gates(self):
+        # El "formateador" corrige lo que agy dejó mal; sin él la verificación fallaría.
+        fixer = "python3 -c \"import pathlib; p = pathlib.Path('src/calc.py'); p.write_text(p.read_text().replace('a - b', 'a + b'))\""
+        (self.repo / ".agy" / "config.toml").write_text(f"verify = [\'\'\'{VERIFY}\'\'\']\nautofix = [\'\'\'{fixer}\'\'\']\n")
+        self.task("A1")
+        self.plan({"write": {"src/calc.py": BAD}, "so": DONE})
+        self.cli("run", "A1")
+        self.assertEqual((self.state("A1")["state"], self.state("A1")["attempts"]), ("review", 1))
+        self.assertIn("return a + b", self.cli("diff", "A1"))
+
+    def test_search_results_are_embedded(self):
+        self.task("Q1", extra='allowed = ["src/**"]\nsearch = ["NotImplementedError", "no-existe-zzz"]\n')
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.cli("run", "Q1")
+        prompt = self.calls()[0]["argv"][-1]
+        self.assertIn("src/calc.py:2:    raise NotImplementedError", prompt)
+        self.assertIn("`no-existe-zzz` — 0 coincidencia(s)", prompt)
+
+    def test_baseline(self):
+        self.assertIn("LA VERIFICACIÓN BASE FALLA", self.cli("baseline", code=3))  # add aún no existe
+        (self.repo / ".agy" / "config.toml").write_text("verify = ['test -f src/calc.py']\n")
+        self.assertIn("verificación base correcta", self.cli("baseline"))
+        self.assertEqual(self.git("worktree", "list").count("\n"), 1)  # no deja worktrees
+
+    def test_file_map_omits_media(self):
+        (self.repo / "foto.PNG").write_bytes(b"x")
+        (self.repo / "src" / ".gitkeep").write_text("")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "media")
+        self.task("M1")
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.cli("run", "M1")
+        fmap = self.calls()[0]["argv"][-1].split("## Mapa de archivos")[1]
+        self.assertNotIn("foto.PNG", fmap)
+        self.assertNotIn(".gitkeep", fmap)
+        self.assertIn("se omiten 2 archivos", fmap)
+        self.assertIn("README.md", fmap)
 
     def test_overlap_with_running_task(self):
         self.task("T12")

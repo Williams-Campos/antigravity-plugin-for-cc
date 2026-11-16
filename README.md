@@ -38,7 +38,8 @@ Crea dos enlaces: `~/.local/bin/agy-task` y `~/.claude/skills/agy-bridge`. Para 
 
 ```bash
 cd mi-proyecto            # debe ser un repositorio git con al menos un commit
-agy-task init             # crea .agy/ ; edita .agy/config.toml (verify, link)
+agy-task init             # crea .agy/ ; edita .agy/config.toml (verify, link, autofix)
+agy-task baseline         # comprueba que la verificación pasa en un worktree limpio, sin agy
 agy-task new T-001 --role implement --title "..."
 agy-task check T-001
 agy-task run T-001
@@ -62,13 +63,16 @@ conviene repetir la comprobación en vivo con `agy-task doctor --probe`:
 Límites conocidos:
 
 - **Sin comando de verificación no se puede delegar implementación.** Es deliberado.
-- **agy no tiene terminal, ni listado, ni búsqueda.** Recibe un mapa de rutas en el prompt. En agy,
-  permitir un solo comando (`command(ls)`) permite también redirecciones y encadenados, es decir,
-  la terminal entera; por eso no existe la opción.
+- **agy no tiene terminal, ni listado, ni búsqueda.** Recibe un mapa de rutas en el prompt y los
+  resultados de las búsquedas que el manual pida en `search`. En agy, permitir un solo comando
+  (`command(ls)`) permite también redirecciones y encadenados, es decir, la terminal entera; por
+  eso no existe la opción. Por lo mismo, el formateador lo ejecuta el ejecutor (`autofix`).
+- **El worktree parte del último commit.** Los cambios sin commit del proyecto no llegan a agy,
+  salvo los archivos que el manual liste en `seed` (pensado para pruebas escritas por Claude).
 - **La verificación corre en tu máquina** con tus permisos: ejecuta el código que agy escribió.
   Mantén `allowed` estrecho y `risk` honesto.
-- **Dependencias enlazadas** (`link`): agy podría modificarlas a través del enlace; se detecta y
-  se registra como incidente, pero no se revierte.
+- **Dependencias enlazadas** (`link`): agy no puede escribir a través de un enlace que sale de su
+  worktree (lo comprueba `doctor --probe`), pero la verificación sí escribe en ellas (cachés).
 - **El código viaja a Google** al delegar. No delegues archivos con secretos.
 - **La cuota** depende de tu plan de Google; un fallo de cuota termina la tarea con código 10.
 - El resultado de agy es un primer borrador: las compuertas prueban que cumple el contrato, no que
