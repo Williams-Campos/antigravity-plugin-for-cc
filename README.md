@@ -1,6 +1,6 @@
 # agy-bridge
 
-> **Beta (v0.1.0).** Probado en macOS con agy 1.5.8 y 1.5.9 y Python 3.14. Sin licencia definida todavía: repositorio privado hasta decidirla.
+> **Beta (v0.2.0).** Probado en macOS con agy 1.5.8 y 1.5.9 y Python 3.14, sobre un proyecto Flutter real. Sin licencia definida todavía: repositorio privado hasta decidirla.
 
 Usa Antigravity (`agy`, Gemini) como trabajador estrictamente supervisado desde Claude Code.
 Claude decide, escribe un manual por tarea y acepta o rechaza. agy ejecuta aislado. Un ejecutor

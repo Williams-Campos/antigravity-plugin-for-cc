@@ -139,6 +139,12 @@ class Implement(Base):
         self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
         self.cli("fix", "T4", "usa suma, no resta")
         self.assertEqual(self.state("T4")["state"], "review")
+        st = self.state("T4")
+        self.assertEqual(st["attempts"], 3)  # los intentos se acumulan entre run y fix
+        self.assertLess(st["active_secs"], 60)  # tiempo de trabajo, no tiempo de reloj desde el primer run
+        rows = [json.loads(l) for l in (self.repo / ".agy" / "runs" / "usage.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["id"], r["input"]) for r in rows], [("T4", 200), ("T4", 100)])  # por sesión, sin acumular
+        self.assertEqual(st["usage"]["input"], 300)
         self.assertIn("usa suma, no resta", self.calls()[0]["argv"][-1])
 
     def test_blocked_then_fix(self):
@@ -270,6 +276,22 @@ class Implement(Base):
         self.assertNotIn(".gitkeep", fmap)
         self.assertIn("se omiten 2 archivos", fmap)
         self.assertIn("README.md", fmap)
+
+    def test_accept_several_tasks_in_a_row(self):
+        # Flujo en paralelo: dos tareas independientes se aceptan una tras otra, con otros
+        # cambios sin commit presentes en el proyecto.
+        (self.repo / "README.md").write_text("edición local sin commit\n")
+        self.task("P1", extra='allowed = ["src/calc.py"]\n')
+        self.task("P2", extra='allowed = ["src/extra.py"]\nverify = ["test -f src/extra.py"]\n')
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.cli("run", "P1")
+        self.plan({"write": {"src/extra.py": "y = 2\n"}, "so": DONE})
+        self.cli("run", "P2")
+        self.cli("accept", "P1")
+        self.cli("accept", "P2")
+        self.assertEqual(sorted(self.git("diff", "--cached", "--name-only").split()), ["src/calc.py", "src/extra.py"])
+        self.assertEqual((self.repo / "README.md").read_text(), "edición local sin commit\n")
+        self.assertEqual(self.git("worktree", "list").count("\n"), 1)
 
     def test_overlap_with_running_task(self):
         self.task("T12")

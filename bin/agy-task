@@ -789,6 +789,8 @@ def review_level(t, st):
 
 def finish(repo, t, st):
     st["finished"] = time.time()
+    session_secs = round(st["finished"] - st["session_started"], 1)
+    st["active_secs"] = round(st.get("active_secs", 0) + session_secs, 1)  # suma run + cada fix, sin esperas
     st["pid"] = None
     st["review_level"] = review_level(t, st)
     if st["state"] == "review" and st.get("worktree"):
@@ -800,11 +802,13 @@ def finish(repo, t, st):
     save_state(repo, st)
     text = render(t, st)
     (run_dir(repo, t["id"]) / "result.md").write_text(text)
+    before = st.get("usage_before", {})  # cada línea de usage.jsonl es una sesión (run o fix), no el acumulado
+    session_usage = {k: round(v - before.get(k, 0), 1) for k, v in st.get("usage", {}).items()}
     with open(repo / ".agy" / "runs" / "usage.jsonl", "a") as f:
         f.write(json.dumps({"ts": int(st["finished"]), "id": t["id"], "role": t["role"], "model": t["model"],
                             "state": st["state"], "reason": st.get("reason", ""), "attempts": st.get("attempts", 0),
-                            "secs": round(st["finished"] - st["started"], 1), "incidents": len(st.get("incidents", [])),
-                            **st.get("usage", {})}) + "\n")
+                            "secs": session_secs, "incidents": len(st.get("incidents", [])),
+                            **session_usage}) + "\n")
     print(text)
     sys.exit(EXIT.get(st["state"], EXIT_REASON.get(st.get("reason"), 4)))
 
@@ -814,7 +818,7 @@ def render(t, st):
     L = [f"# {tid} · {t['role']} · {state.upper()}" + (f" ({st['reason']})" if st.get("reason") else ""),
          f"{t['title']}"]
     u = st.get("usage", {})
-    L.append(f"intentos: {st.get('attempts', 0)} · duración: {fmt_secs(st.get('finished', time.time()) - st['started'])}"
+    L.append(f"intentos: {st.get('attempts', 0)} · tiempo de trabajo: {fmt_secs(st.get('active_secs', 0))}"
              f" · modelo: {t['model']} · tokens agy: {u.get('input', 0)} in / {u.get('output', 0)} out")
     if st.get("detail"):
         L.append(f"detalle: {st['detail']}")
@@ -867,7 +871,8 @@ def render(t, st):
 
 def begin(repo, t, extra):
     st = {"id": t["id"], "role": t["role"], "state": "running", "reason": "", "detail": "",
-          "started": time.time(), "pid": os.getpid(), "attempts": 0, "incidents": [], "gates": {},
+          "started": time.time(), "session_started": time.time(), "active_secs": 0,
+          "pid": os.getpid(), "attempts": 0, "incidents": [], "gates": {},
           "model": t["model"], "risk": t["risk"], "title": t["title"], **extra}
     save_state(repo, st)
     signal.signal(signal.SIGTERM, lambda *_: (_kill_child(), _cancelled(repo, st)))
@@ -964,7 +969,9 @@ def cmd_fix(args):
                          "seeds": t["seed"]})
     st.update(attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
               usage=prev.get("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0}),
-              started=prev.get("started", time.time()), conversation_id=prev.get("conversation_id"))
+              usage_before=dict(prev.get("usage", {})),
+              started=prev.get("started", time.time()), active_secs=prev.get("active_secs", 0),
+              conversation_id=prev.get("conversation_id"))
     msg = ("Mensaje del supervisor (Claude) sobre tu trabajo en esta tarea:\n\n" + args.message.strip() +
            "\n\nAplica lo indicado dentro de los archivos permitidos y entrega de nuevo el reporte estructurado.")
     conv = prev.get("conversation_id")
@@ -1061,14 +1068,18 @@ def cmd_accept(args):
     if st.get("review_level") == "diff" and not args.reviewed:
         die(f"esta tarea exige leer el diff (riesgo {st.get('risk')}, incidentes: {len(st.get('incidents', []))}). "
             f"Ejecuta `agy-task diff {args.id}`, revísalo y repite con --reviewed.")
-    if git(repo, "diff", "--cached", "--quiet", check=False).returncode != 0:
-        die("hay cambios ya preparados (staged) en el proyecto: haz commit o quítalos del índice antes de aceptar.")
-    m = git(repo, "merge", "--squash", st["branch"], check=False)
-    if m.returncode != 0:
-        if git(repo, "ls-files", "-u").strip():
-            git(repo, "reset", "--merge", check=False)
-        die("no se pudo integrar (conflicto con cambios del proyecto):\n" + tail((m.stdout + m.stderr).strip(), 1500) +
-            f"\nEl proyecto quedó como estaba. Opciones: confirma tus cambios locales y reintenta, o `agy-task run {args.id} --restart`.", 3)
+    # Se integra como parche atómico sobre el índice y el árbol de trabajo: o entra completo o no
+    # toca nada. Solo exige que los archivos de la tarea no tengan cambios locales, así que se
+    # pueden aceptar varias tareas seguidas y convivir con otros cambios sin commit.
+    patch = subprocess.run(["git", "-C", str(repo), "diff", "--binary", "--no-renames", st["base"], st["branch"]],
+                           capture_output=True).stdout
+    for extra in (["--check"], []):
+        a = subprocess.run(["git", "-C", str(repo), "apply", "--index", *extra, "-"], input=patch, capture_output=True)
+        if a.returncode != 0:
+            die("no se pudo integrar: los archivos de la tarea cambiaron en el proyecto desde que agy empezó.\n"
+                + tail(a.stderr.decode(errors="replace").strip(), 1500) +
+                f"\nEl proyecto quedó como estaba. Opciones: confirma o descarta tus cambios en esos archivos y "
+                f"reintenta, o `agy-task run {args.id} --restart` para rehacerla sobre el estado actual.", 3)
     st.update(state="accepted", finished=time.time())
     save_state(repo, st)
     if not args.keep:
@@ -1106,7 +1117,7 @@ def cmd_result(args):
     if st.get("state") == "running":
         up = "activo" if alive(st.get("pid")) else "PROCESO MUERTO (usa run --restart)"
         print(f"{args.id} en ejecución ({up}), intento {st.get('attempts', 0)}, "
-              f"{fmt_secs(time.time() - st['started'])} transcurridos.")
+              f"{fmt_secs(time.time() - st.get('session_started', st['started']))} transcurridos.")
         sys.exit(0)
     sys.stdout.write(p.read_text() if p.exists() else f"{args.id}: estado {st.get('state')} (sin result.md)\n")
 
@@ -1126,7 +1137,9 @@ def cmd_status(args):
             state = "running(muerto)"
         extra = f" ({st['reason']})" if st.get("reason") else ""
         lvl = f" · revisión: {st['review_level']}" if state == "review" else ""
-        print(f"{tid:<14} {st.get('role', '-'):<10} {state + extra:<26} {st.get('title', '')}{lvl}")
+        shown = state + extra
+        shown = shown if len(shown) <= 26 else shown[:25] + "…"
+        print(f"{tid:<14} {st.get('role', '-'):<10} {shown:<26} {st.get('title', '')}{lvl}")
 
 
 def cmd_check(args):
