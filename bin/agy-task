@@ -1,0 +1,1219 @@
+#!/usr/bin/env python3
+"""agy-task — ejecutor supervisado de tareas de Antigravity (agy) para Claude Code.
+
+Claude escribe un manual por tarea (.agy/tasks/<id>.md); este ejecutor lanza agy
+aislado (worktree propio, sin terminal, sin escritura fuera de su carpeta), aplica
+compuertas deterministas y deja un resultado corto para que Claude decida.
+
+Códigos de salida: 0 listo (review/done) · 1 uso o manual inválido · 2 bloqueado
+(agy tiene preguntas) · 3 compuertas fallidas · 4 fallo del ejecutor ·
+10 cuota · 11 autenticación · 12 timeout
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    sys.exit("agy-task: requiere Python 3.11 o superior (tomllib).")
+
+BRIDGE = Path(os.path.realpath(__file__)).parent.parent
+AGY = os.environ.get("AGY_BIN", "agy")
+HOME = Path(os.environ.get("AGY_BRIDGE_HOME", str(Path.home() / ".agy-bridge")))
+
+ROLES = ("implement", "explore", "review")
+RISKS = ("low", "medium", "high")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$")
+PLACEHOLDER = "«"
+PROMPT_LIMIT = 60_000  # bytes; agy acepta hasta ~64 KB en -p
+IMPLICIT_FORBIDDEN = [".agy/**", ".git/**"]
+CACHE_DIRS = {".cache", "__pycache__", ".vite", ".pytest_cache", ".turbo", ".parcel-cache"}
+
+DEFAULTS = {
+    "model_implement": "gemini-4-hydrogen-high",
+    "model_explore": "gemini-4-hydrogen-high",
+    "model_review": "gemini-4-argon-high",
+    "verify": [],
+    "link": [],
+    "setup": [],
+    "max_fixups": 2,
+    "max_diff_lines": 800,
+    "timeout_min": 30,
+    "verify_timeout_min": 15,
+    "worktree_root": "",
+}
+TASK_KEYS = {
+    "id", "title", "role", "risk", "model", "allowed", "forbidden", "protected",
+    "verify", "max_fixups", "max_diff_lines", "timeout_min", "target",
+}
+EXIT = {"review": 0, "done": 0, "accepted": 0, "blocked": 2}
+EXIT_REASON = {"quota": 10, "auth": 11, "timeout": 12, "gates": 3}
+
+SCHEMAS = {
+    "implement": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["done", "blocked"]},
+            "summary": {"type": "string"},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "decisions": {"type": "array", "items": {"type": "string"}},
+            "questions": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["status", "summary", "files_changed", "decisions", "questions"],
+    },
+    "explore": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["done", "blocked"]},
+            "summary": {"type": "string"},
+            "findings": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "line": {"type": "integer"},
+                               "note": {"type": "string"}},
+                "required": ["path", "note"]}},
+            "questions": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["status", "summary", "findings", "questions"],
+    },
+    "review": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["done", "blocked"]},
+            "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+            "summary": {"type": "string"},
+            "issues": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                               "path": {"type": "string"}, "line": {"type": "integer"},
+                               "note": {"type": "string"}},
+                "required": ["severity", "path", "note"]}},
+            "questions": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["status", "verdict", "summary", "issues", "questions"],
+    },
+}
+
+_child = None  # proceso hijo en curso (para cancelarlo con la señal)
+
+
+# ───────────────────────── utilidades ─────────────────────────
+
+def die(msg, code=1):
+    print(f"agy-task: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def git(cwd, *args, check=True):
+    p = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        die(f"git {' '.join(args)} falló: {p.stderr.strip() or p.stdout.strip()}", 4)
+    return p.stdout if check else p
+
+
+def repo_root():
+    p = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if p.returncode != 0:
+        die("ejecútalo dentro de un repositorio git (el proyecto de trabajo).")
+    return Path(p.stdout.strip())
+
+
+def norm(s):
+    s = unicodedata.normalize("NFD", s)
+    return "".join(c for c in s if unicodedata.category(c) != "Mn").lower().strip()
+
+
+def section(body, name):
+    """Texto de la sección '## name' (sin distinguir acentos ni mayúsculas)."""
+    out, on = [], False
+    for line in body.splitlines():
+        m = re.match(r"^##\s+(.*?)\s*$", line)
+        if m:
+            on = norm(m.group(1)) == norm(name)
+            continue
+        if on:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def glob_re(pat):
+    pat = pat.strip()
+    if pat.startswith("./"):
+        pat = pat[2:]
+    if pat.endswith("/"):
+        pat += "**"
+    out, i = "", 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out += "(?:.*/)?"
+            i += 3
+        elif pat.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif pat[i] == "*":
+            out += "[^/]*"
+            i += 1
+        elif pat[i] == "?":
+            out += "[^/]"
+            i += 1
+        else:
+            out += re.escape(pat[i])
+            i += 1
+    return re.compile(out + r"(?:/.*)?\Z")  # un directorio cubre todo lo que contiene
+
+
+def matches(path, patterns):
+    return any(glob_re(p).match(path) for p in patterns)
+
+
+def literal_prefix(pat):
+    pat = pat.strip()
+    if pat.startswith("./"):
+        pat = pat[2:]
+    return re.split(r"[*?]", pat, maxsplit=1)[0]
+
+
+def patterns_overlap(a, b):
+    for x in a:
+        for y in b:
+            px, py = literal_prefix(x), literal_prefix(y)
+            if px.startswith(py) or py.startswith(px):
+                return x, y
+    return None
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def tail(text, n=4000):
+    return text if len(text) <= n else "…" + text[-n:]
+
+
+def fmt_secs(s):
+    s = int(s)
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+# ───────────────────────── config, tareas, estado ─────────────────────────
+
+def load_config(repo):
+    cfg = dict(DEFAULTS)
+    p = repo / ".agy" / "config.toml"
+    if p.exists():
+        try:
+            data = tomllib.loads(p.read_text())
+        except tomllib.TOMLDecodeError as e:
+            die(f".agy/config.toml inválido: {e}")
+        unknown = set(data) - set(DEFAULTS)
+        if unknown:
+            die(f".agy/config.toml: claves desconocidas: {', '.join(sorted(unknown))}")
+        cfg.update(data)
+    return cfg
+
+
+def task_path(repo, tid):
+    return repo / ".agy" / "tasks" / f"{tid}.md"
+
+
+def load_task(repo, tid):
+    if not ID_RE.match(tid):
+        die(f"id inválido: {tid!r}")
+    p = task_path(repo, tid)
+    if not p.exists():
+        die(f"no existe el manual {p.relative_to(repo)} (créalo con: agy-task new {tid})")
+    m = re.match(r"\+\+\+\n(.*?)\n\+\+\+[ \t]*\n?(.*)", p.read_text(), re.S)
+    if not m:
+        die(f"{p.name}: falta la cabecera TOML entre líneas '+++'.")
+    try:
+        meta = tomllib.loads(m.group(1))
+    except tomllib.TOMLDecodeError as e:
+        die(f"{p.name}: cabecera TOML inválida: {e}")
+    meta["_body"] = m.group(2).strip()
+    return meta
+
+
+def resolved(task, cfg):
+    """Tarea con los valores por defecto del proyecto aplicados."""
+    t = dict(task)
+    t.setdefault("role", "implement")
+    t.setdefault("risk", "medium")
+    t.setdefault("title", t.get("id", ""))
+    for k in ("allowed", "forbidden", "protected"):
+        t.setdefault(k, [])
+    t.setdefault("verify", cfg["verify"])
+    t.setdefault("model", cfg.get(f"model_{t['role']}", cfg["model_implement"]))
+    default_timeout = cfg["timeout_min"] if t["role"] == "implement" else min(cfg["timeout_min"], 10)
+    t.setdefault("timeout_min", default_timeout)
+    for k in ("max_fixups", "max_diff_lines"):
+        t.setdefault(k, cfg[k])
+    return t
+
+
+def validate(repo, task, tid):
+    errs = []
+    unknown = set(task) - TASK_KEYS - {"_body"}
+    if unknown:
+        errs.append(f"claves desconocidas en la cabecera: {', '.join(sorted(unknown))}")
+    if task.get("id") != tid:
+        errs.append(f"id = {task.get('id')!r} no coincide con el nombre del archivo ({tid})")
+    role, risk = task.get("role", "implement"), task.get("risk", "medium")
+    if role not in ROLES:
+        errs.append(f"role debe ser uno de {ROLES}")
+    if risk not in RISKS:
+        errs.append(f"risk debe ser uno de {RISKS}")
+    for k in ("allowed", "forbidden", "protected", "verify"):
+        v = task.get(k, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
+            errs.append(f"{k} debe ser una lista de textos no vacíos")
+            continue
+        if k in ("allowed", "forbidden", "protected"):
+            for x in v:
+                if x.startswith("/") or ".." in Path(x).parts:
+                    errs.append(f"{k}: ruta no permitida {x!r} (usa rutas relativas al repo, sin '..')")
+    for k in ("max_fixups", "max_diff_lines", "timeout_min"):
+        if k in task and (not isinstance(task[k], int) or isinstance(task[k], bool) or task[k] < 0):
+            errs.append(f"{k} debe ser un entero ≥ 0")
+    body = task.get("_body", "")
+    if PLACEHOLDER in body or PLACEHOLDER in str(task.get("title", "")):
+        errs.append("el manual aún tiene marcadores «…» de la plantilla sin rellenar")
+    if not section(body, "Objetivo"):
+        errs.append("falta la sección '## Objetivo'")
+    if role == "implement":
+        if risk == "high":
+            errs.append("risk = high no se delega como implementación: hazlo tú (Claude) "
+                        "o divide la tarea y delega solo la parte de riesgo bajo/medio")
+        if not task.get("allowed"):
+            errs.append("implement requiere 'allowed' (archivos que agy puede tocar)")
+        if not task.get("verify"):
+            errs.append("implement requiere 'verify' (en el manual o en .agy/config.toml): "
+                        "sin verificación automática no hay supervisión")
+        if not section(body, "Criterios de aceptación"):
+            errs.append("falta la sección '## Criterios de aceptación'")
+    if role == "review":
+        tgt = task.get("target", "")
+        if tgt != "working" and not (isinstance(tgt, str) and ID_RE.match(tgt)):
+            errs.append("review requiere target = \"<id de tarea>\" o target = \"working\"")
+    return errs
+
+
+def run_dir(repo, tid):
+    return repo / ".agy" / "runs" / tid
+
+
+def load_state(repo, tid):
+    p = run_dir(repo, tid) / "state.json"
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(repo, st):
+    d = run_dir(repo, st["id"])
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / "state.json.tmp"
+    tmp.write_text(json.dumps(st, indent=1, ensure_ascii=False))
+    tmp.replace(d / "state.json")
+
+
+def worktree_path(repo, cfg, tid):
+    root = Path(cfg["worktree_root"]).expanduser() if cfg["worktree_root"] else HOME / "worktrees"
+    tag = hashlib.sha1(str(repo).encode()).hexdigest()[:8]
+    return root / f"{repo.name}-{tag}" / tid
+
+
+def branch_name(tid):
+    return f"agy/{tid}"
+
+
+def branch_exists(repo, tid):
+    return git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch_name(tid)}",
+               check=False).returncode == 0
+
+
+def drop_work(repo, cfg, tid):
+    wt = worktree_path(repo, cfg, tid)
+    if wt.exists():
+        git(repo, "worktree", "remove", "--force", str(wt), check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+    git(repo, "worktree", "prune", check=False)
+    if branch_exists(repo, tid):
+        git(repo, "branch", "-D", "-q", branch_name(tid), check=False)
+
+
+# ───────────────────────── llamada a agy ─────────────────────────
+
+def _kill_child(*_):
+    if _child and _child.poll() is None:
+        try:
+            os.killpg(_child.pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def call_agy(cwd, prompt, model, settings, schema, timeout_s, out_base, mode=None, conversation=None):
+    """Ejecuta un turno headless de agy. Devuelve dict con kind = ok|missing|timeout|quota|auth|model|error."""
+    global _child
+    if len(prompt.encode()) > PROMPT_LIMIT:
+        return {"kind": "error", "detail": "el prompt supera 60 KB: acorta el manual o divide la tarea", "env": {}}
+    cmd = [AGY, "--model", model, "--settings", json.dumps(settings),
+           "--output-format", "json", "--json-schema", json.dumps(schema),
+           "--print-timeout", f"{int(timeout_s)}s", "--disable-slash-commands"]
+    if mode:
+        cmd += ["--mode", mode]
+    if conversation:
+        cmd += ["--conversation", conversation]
+    cmd += ["-p", prompt]
+    out_p, err_p = Path(f"{out_base}.json"), Path(f"{out_base}.err")
+    t0 = time.time()
+    try:
+        with open(out_p, "wb") as fo, open(err_p, "wb") as fe:
+            _child = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=fo,
+                                      stderr=fe, start_new_session=True)
+            try:
+                rc = _child.wait(timeout=timeout_s + 90)
+            except subprocess.TimeoutExpired:
+                _kill_child()
+                try:
+                    _child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(_child.pid, signal.SIGKILL)
+                return {"kind": "timeout", "detail": f"agy no terminó en {fmt_secs(timeout_s + 90)}",
+                        "env": {}, "secs": time.time() - t0}
+    except FileNotFoundError:
+        return {"kind": "missing", "detail": f"no se encontró el binario '{AGY}'", "env": {}}
+    finally:
+        _child = None
+    secs = time.time() - t0
+    raw = out_p.read_text(errors="replace")
+    err = err_p.read_text(errors="replace")
+    env = {}
+    try:
+        env = json.loads(raw)
+    except ValueError:
+        for line in reversed(raw.strip().splitlines()):
+            try:
+                env = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if not isinstance(env, dict):
+        env = {}
+    if rc == 0 and env.get("status") == "SUCCESS":
+        return {"kind": "ok", "env": env, "secs": secs}
+    blob = (json.dumps(env.get("error", "")) + " " + str(env.get("finished_reason", "")) + " " + err).lower()
+    if "print_timeout" in blob or "print timeout" in blob:
+        kind = "timeout"
+    elif re.search(r"quota|rate.?limit|resource_exhausted|429", blob):
+        kind = "quota"
+    elif re.search(r"unauthenticated|not authenticated|sign in|login required|oauth|401", blob):
+        kind = "auth"
+    elif re.search(r"model.{0,40}(not found|unavailable|not available)|available models", blob):
+        kind = "model"
+    else:
+        kind = "error"
+    detail = tail((err.strip() or raw.strip() or f"rc={rc}"), 600)
+    return {"kind": kind, "env": env, "secs": secs, "detail": f"rc={rc} status={env.get('status')}: {detail}"}
+
+
+def add_usage(st, r):
+    u = (r.get("env") or {}).get("usage") or {}
+    tot = st.setdefault("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0})
+    tot["input"] += u.get("input_tokens", 0)
+    tot["output"] += u.get("output_tokens", 0)
+    tot["cache_read"] += u.get("cache_read_tokens", 0)
+    tot["agy_secs"] = round(tot["agy_secs"] + r.get("secs", 0), 1)
+
+
+def settings_for(role):
+    """Permisos por sesión (no tocan la configuración global de agy).
+
+    Nunca se concede terminal: en agy una regla command(<prefijo>) acepta también
+    redirecciones, encadenados y subshells (medido en agy 1.5.8), así que permitir un
+    solo comando equivale a permitirlos todos. Por eso agy recibe un mapa de archivos
+    en el prompt en lugar de `ls`/`grep`.
+
+    toolPermission se fija siempre para no heredar un modo más permisivo de la configuración
+    global. En solo lectura hace falta además agentMode="" : sin él, el modo Auto por defecto
+    de agy (≥ 1.5.7) aprueba las ediciones dentro del workspace aunque estén en `ask`.
+    """
+    if role == "implement":  # se combina con --mode accept-edits: edición solo dentro del workspace
+        return {"allowNonWorkspaceAccess": False, "toolPermission": "request-review",
+                "permissions": {"allow": []}}
+    return {"allowNonWorkspaceAccess": False, "agentMode": "", "toolPermission": "request-review",
+            "permissions": {"allow": [], "ask": ["write_file(*)", "command(*)"]}}
+
+
+# ───────────────────────── prompts ─────────────────────────
+
+def rules(role):
+    return (BRIDGE / "rules" / f"{role}.md").read_text().strip()
+
+
+def bullets(items, empty="(ninguno)"):
+    return "\n".join(f"- {x}" for x in items) if items else empty
+
+
+def file_map(cwd, focus, budget=12000):
+    """Mapa de archivos para el prompt: agy no tiene herramienta de listado ni de búsqueda."""
+    files = [f for f in git(cwd, "ls-files", "-co", "--exclude-standard").splitlines()
+             if f and not f.startswith(".agy/")]
+    head = "## Mapa de archivos (no tienes listado ni búsqueda: usa estas rutas con tu lectura de archivos)\n"
+    full = "\n".join(files)
+    if len(full) <= budget:
+        return head + full
+    near = [f for f in files if focus and matches(f, focus)]
+    out, used = [], 0
+    for f in near:
+        if used + len(f) + 1 > budget // 2:
+            out.append(f"… ({len(near) - len(out)} más en la zona de trabajo)")
+            break
+        out.append(f)
+        used += len(f) + 1
+    dirs = {}
+    for f in files:
+        d = "/".join(f.split("/")[:3][:-1]) or "."
+        dirs[d] = dirs.get(d, 0) + 1
+    summary, used = [], 0
+    for d, n in sorted(dirs.items()):
+        line = f"{d}/ ({n} archivos)"
+        if used + len(line) + 1 > budget // 2:
+            summary.append("…")
+            break
+        summary.append(line)
+        used += len(line) + 1
+    return (head + ("Zona de trabajo:\n" + "\n".join(out) + "\n\n" if out else "")
+            + "Resto del proyecto, por directorio (el manual debe darte las rutas exactas que necesites):\n"
+            + "\n".join(summary))
+
+
+def implement_prompt(t, wt):
+    term = "No tienes terminal."
+    return "\n\n".join([
+        rules("implement"),
+        f"## Contrato de la tarea {t['id']} — {t['title']}",
+        f"Archivos permitidos (solo puedes crear o modificar estos):\n{bullets(t['allowed'])}",
+        f"Archivos prohibidos:\n{bullets(t['forbidden'] + IMPLICIT_FORBIDDEN)}",
+        f"Archivos protegidos (no los modifiques; definen qué es correcto):\n{bullets(t['protected'])}",
+        f"{term} El supervisor ejecutará estas verificaciones cuando termines:\n{bullets(t['verify'])}",
+        f"Tamaño orientativo máximo del cambio: {t['max_diff_lines']} líneas.",
+        "## Manual",
+        t["_body"],
+        file_map(wt, t["allowed"]),
+    ])
+
+
+def explore_prompt(t, cwd):
+    focus = f"Zonas de interés:\n{bullets(t['allowed'])}\n\n" if t["allowed"] else ""
+    return "\n\n".join([rules("explore"), f"## Encargo {t['id']} — {t['title']}", focus + t["_body"],
+                        file_map(cwd, t["allowed"])])
+
+
+def review_prompt(t, diff, cwd):
+    return "\n\n".join([rules("review"), f"## Revisión {t['id']} — {t['title']}", t["_body"],
+                        "## Diff a revisar", "```diff\n" + diff + "\n```", file_map(cwd, [], budget=6000)])
+
+
+# ───────────────────────── compuertas ─────────────────────────
+
+def link_deps(repo, wt, links):
+    made = []
+    for rel in links:
+        src, dst = repo / rel, wt / rel
+        if src.exists() and not dst.exists() and not dst.is_symlink():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.symlink_to(src, target_is_directory=src.is_dir())
+            made.append(rel)
+    return made
+
+
+def touched_since(target, ts, cap=5):
+    hits = []
+    if target.is_file():
+        return [str(target)] if target.stat().st_mtime > ts else []
+    for dp, dn, fn in os.walk(target):
+        dn[:] = [d for d in dn if d not in CACHE_DIRS]
+        for f in fn:
+            fp = os.path.join(dp, f)
+            try:
+                if os.lstat(fp).st_mtime > ts:
+                    hits.append(fp)
+                    if len(hits) >= cap:
+                        return hits
+            except OSError:
+                pass
+    return hits
+
+
+def stage(wt, links):
+    git(wt, "add", "-A", "--", ".", *[f":(exclude){l}" for l in links])
+
+
+def changed(wt, base):
+    out = git(wt, "diff", "--cached", "--no-renames", "--name-status", "-z", base)
+    parts = out.split("\0")
+    return [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
+
+
+def numstat(wt, base):
+    stats, total = {}, 0
+    out = git(wt, "diff", "--cached", "--no-renames", "--numstat", "-z", base)
+    for rec in out.split("\0"):
+        f = rec.split("\t")
+        if len(f) == 3:
+            a = int(f[0]) if f[0].isdigit() else 0
+            d = int(f[1]) if f[1].isdigit() else 0
+            stats[f[2]] = (a, d)
+            total += a + d
+    return stats, total
+
+
+def restore(wt, base, status, path):
+    if status == "A":
+        git(wt, "rm", "-f", "-q", "--cached", "--", path, check=False)
+        try:
+            (wt / path).unlink()
+        except OSError:
+            pass
+    else:
+        git(wt, "checkout", "-q", base, "--", path)
+
+
+def enforce_scope(wt, base, t, links, attempt):
+    """Deja el índice solo con cambios dentro del alcance. Devuelve (cambios, incidentes)."""
+    stage(wt, links)
+    incidents = []
+    forbidden = t["forbidden"] + IMPLICIT_FORBIDDEN
+    for status, path in changed(wt, base):
+        if matches(path, t["protected"]):
+            kind = "protegido_modificado"
+        elif matches(path, forbidden):
+            kind = "prohibido"
+        elif not matches(path, t["allowed"]):
+            kind = "fuera_de_alcance"
+        else:
+            continue
+        restore(wt, base, status, path)
+        incidents.append({"attempt": attempt, "kind": kind, "path": path})
+    if incidents:
+        stage(wt, links)
+    return changed(wt, base), incidents
+
+
+def run_verify(wt, cmds, timeout_s, log_path, tid):
+    env = dict(os.environ, CI="1", AGY_TASK_ID=tid)
+    with open(log_path, "wb") as log:
+        for c in cmds:
+            log.write(f"$ {c}\n".encode())
+            log.flush()
+            p = subprocess.Popen(["/bin/bash", "-c", c], cwd=str(wt), stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
+            try:
+                rc = p.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                log.write(f"\n[timeout tras {fmt_secs(timeout_s)}]\n".encode())
+                rc = 124
+            if rc != 0:
+                log.flush()
+                return {"ok": False, "command": c, "rc": rc,
+                        "tail": tail(Path(log_path).read_text(errors="replace"))}
+    return {"ok": True, "commands": len(cmds)}
+
+
+def commit(wt, t):
+    if git(wt, "diff", "--cached", "--quiet", "HEAD", check=False).returncode == 0:
+        return
+    ident = []
+    if git(wt, "config", "user.email", check=False).returncode != 0:
+        ident = ["-c", "user.name=agy-task", "-c", "user.email=agy-task@localhost"]
+    git(wt, *ident, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify",
+        "-m", f"agy({t['id']}): {t['title']}")
+
+
+# ───────────────────────── supervisión ─────────────────────────
+
+def supervise(repo, t, cfg, st, message, conversation=None):
+    """Bucle intento → compuertas → corrección. Deja el estado final en st."""
+    wt, base, rd = Path(st["worktree"]), st["base"], run_dir(repo, t["id"])
+    links = st.get("links", [])
+    problem = "gates"
+    for _ in range(1 + t["max_fixups"]):
+        st["attempts"] = n = st.get("attempts", 0) + 1
+        save_state(repo, st)
+        t_agy = time.time()
+        r = call_agy(wt, message, t["model"], settings_for("implement"),
+                     SCHEMAS["implement"], t["timeout_min"] * 60, rd / f"attempt-{n}",
+                     mode="accept-edits", conversation=conversation)
+        add_usage(st, r)
+        if r["kind"] != "ok":
+            st.update(state="failed", reason=r["kind"], detail=r.get("detail", ""))
+            return
+        env = r["env"]
+        conversation = env.get("conversation_id") or conversation
+        st["conversation_id"] = conversation
+
+        for rel in links:  # ¿tocó dependencias compartidas durante su turno?
+            for hit in touched_since((repo / rel).resolve(), t_agy):
+                st["incidents"].append({"attempt": n, "kind": "dependencias_enlazadas_modificadas", "path": hit})
+        files, inc = enforce_scope(wt, base, t, links, n)
+        st["incidents"] += inc
+        reverted = ("\nAdemás, estos cambios se revirtieron por estar fuera de tu alcance: "
+                    + ", ".join(f"{i['path']} ({i['kind']})" for i in inc) + ".") if inc else ""
+
+        denied = env.get("denied_actions") or []
+        so = env.get("structured_output")
+        if denied:
+            names = ", ".join(sorted({f"{d.get('display_name', '?')}/{d.get('action', '?')}" for d in denied}))
+            st["gates"] = {"turno": {"ok": False, "detail": f"acción denegada: {names}"}}
+            problem = "denied"
+            message = (f"Tu turno anterior se canceló porque intentaste una acción no permitida ({names}). "
+                       "No tienes terminal ni acceso fuera del workspace. "
+                       "Revisa el estado actual de los archivos, completa lo que falte sin esa acción y "
+                       "entrega el reporte estructurado." + reverted)
+            continue
+        if not isinstance(so, dict) or so.get("status") not in ("done", "blocked"):
+            st["gates"] = {"turno": {"ok": False, "detail": "sin reporte estructurado"}}
+            problem = "no_report"
+            message = ("No entregaste el reporte estructurado. Comprueba que la tarea esté completa y "
+                       "responde solo con el reporte." + reverted)
+            continue
+        st["report"] = so
+        if so["status"] == "blocked":
+            st.update(state="blocked", reason="preguntas", detail="")
+            return
+
+        gates = {"cambios": {"ok": bool(files), "detail": f"{len(files)} archivo(s)"}}
+        st["gates"] = gates
+        if not files:
+            problem = "gates"
+            message = ("Reportaste 'done' pero no quedó ningún cambio dentro de los archivos permitidos."
+                       + reverted + " Implementa la tarea dentro del alcance, o responde 'blocked' "
+                       "explicando qué necesitas.")
+            continue
+        _, total = numstat(wt, base)
+        gates["tamaño"] = {"ok": total <= t["max_diff_lines"], "detail": f"{total}/{t['max_diff_lines']} líneas",
+                           "warning": True}
+        v = run_verify(wt, t["verify"], cfg["verify_timeout_min"] * 60, rd / f"verify-{n}.log", t["id"])
+        git(wt, "clean", "-fdq", *[x for l in links for x in ("-e", l)], check=False)  # artefactos de la verificación
+        gates["verify"] = ({"ok": True, "detail": f"{v['commands']} comando(s)"} if v["ok"] else
+                           {"ok": False, "detail": f"falló `{v['command']}` (rc={v['rc']})"})
+        if not v["ok"]:
+            problem = "gates"
+            message = ("La verificación del supervisor falló.\n"
+                       f"Comando: {v['command']}\nSalida (final):\n```\n{v['tail']}\n```\n"
+                       "Corrige la implementación dentro de los archivos permitidos. No modifiques "
+                       "archivos protegidos. Entrega de nuevo el reporte estructurado." + reverted)
+            continue
+        commit(wt, t)
+        st.update(state="review", reason="", detail="")
+        return
+    st.update(state="failed", reason="gates" if problem == "gates" else problem,
+              detail="se agotaron los intentos de corrección")
+
+
+def review_level(t, st):
+    if t["role"] != "implement":
+        return "ninguna"
+    oversize = not st.get("gates", {}).get("tamaño", {}).get("ok", True)
+    if t["risk"] == "low" and not st.get("incidents") and not oversize:
+        return "resumen"
+    return "diff"
+
+
+def finish(repo, t, st):
+    st["finished"] = time.time()
+    st["pid"] = None
+    st["review_level"] = review_level(t, st)
+    if st["state"] == "review" and st.get("worktree"):
+        wt = Path(st["worktree"])
+        stats, total = numstat(wt, st["base"])
+        st["files"] = [{"status": s, "path": p, "added": stats.get(p, (0, 0))[0],
+                        "deleted": stats.get(p, (0, 0))[1]} for s, p in changed(wt, st["base"])]
+        st["diff_lines"] = total
+    save_state(repo, st)
+    text = render(t, st)
+    (run_dir(repo, t["id"]) / "result.md").write_text(text)
+    with open(repo / ".agy" / "runs" / "usage.jsonl", "a") as f:
+        f.write(json.dumps({"ts": int(st["finished"]), "id": t["id"], "role": t["role"], "model": t["model"],
+                            "state": st["state"], "reason": st.get("reason", ""), "attempts": st.get("attempts", 0),
+                            "secs": round(st["finished"] - st["started"], 1), "incidents": len(st.get("incidents", [])),
+                            **st.get("usage", {})}) + "\n")
+    print(text)
+    sys.exit(EXIT.get(st["state"], EXIT_REASON.get(st.get("reason"), 4)))
+
+
+def render(t, st):
+    tid, state = t["id"], st["state"]
+    L = [f"# {tid} · {t['role']} · {state.upper()}" + (f" ({st['reason']})" if st.get("reason") else ""),
+         f"{t['title']}"]
+    u = st.get("usage", {})
+    L.append(f"intentos: {st.get('attempts', 0)} · duración: {fmt_secs(st.get('finished', time.time()) - st['started'])}"
+             f" · modelo: {t['model']} · tokens agy: {u.get('input', 0)} in / {u.get('output', 0)} out")
+    if st.get("detail"):
+        L.append(f"detalle: {st['detail']}")
+    if st.get("dirty_base"):
+        L.append("aviso: el proyecto tenía cambios sin commit al lanzar; agy trabajó sobre el último commit, sin ellos.")
+    if st.get("gates"):
+        L.append("compuertas: " + " · ".join(
+            f"{k} {'✓' if g['ok'] else ('⚠' if g.get('warning') else '✗')} ({g['detail']})"
+            for k, g in st["gates"].items()))
+    if st.get("incidents"):
+        L.append(f"incidentes ({len(st['incidents'])}):")
+        L += [f"  - intento {i['attempt']}: {i['kind']}: {i['path']}" for i in st["incidents"][:15]]
+    if st.get("files"):
+        L.append(f"archivos ({len(st['files'])}, {st.get('diff_lines', 0)} líneas):")
+        L += [f"  {f['status']} {f['path']} (+{f['added']} −{f['deleted']})" for f in st["files"][:40]]
+    rep = st.get("report") or {}
+    if rep.get("verdict"):
+        L.append(f"veredicto: {rep['verdict']}")
+    if rep.get("summary"):
+        L.append(f"resumen de agy: {rep['summary'].strip()}")
+    for key, label in (("decisions", "decisiones de agy"), ("questions", "preguntas de agy")):
+        if rep.get(key):
+            L.append(f"{label}:")
+            L += [f"  - {x}" for x in rep[key][:15]]
+    for key, label in (("findings", "hallazgos"), ("issues", "problemas")):
+        if rep.get(key):
+            L.append(f"{label} ({len(rep[key])}):")
+            for x in rep[key][:40]:
+                loc = x.get("path", "") + (f":{x['line']}" if x.get("line") else "")
+                sev = f"[{x['severity']}] " if x.get("severity") else ""
+                L.append(f"  - {sev}{loc} — {x.get('note', '')}")
+    nxt = {
+        "review": {"resumen": f"riesgo bajo y sin incidentes → puedes aceptar con el resumen: agy-task accept {tid}",
+                   "diff": f"lee el diff antes de aceptar: agy-task diff {tid} → agy-task accept {tid} --reviewed"
+                   }.get(st.get("review_level"), ""),
+        "blocked": f"responde las preguntas: agy-task fix {tid} \"<respuestas>\"  (o corrige el manual y run --restart)",
+        "failed": (f"revisa .agy/runs/{tid}/ (verify-*.log, attempt-*.err); opciones: agy-task fix {tid} \"<indicación>\""
+                   f" · agy-task run {tid} --restart · hacerlo tú · agy-task reject {tid}"),
+    }.get(state, "")
+    if state == "review":
+        nxt += f"\n  alternativas: agy-task fix {tid} \"<corrección>\" · agy-task reject {tid}"
+    if nxt:
+        L.append(f"siguiente: {nxt}")
+    return "\n".join(L) + "\n"
+
+
+def begin(repo, t, extra):
+    st = {"id": t["id"], "role": t["role"], "state": "running", "reason": "", "detail": "",
+          "started": time.time(), "pid": os.getpid(), "attempts": 0, "incidents": [], "gates": {},
+          "model": t["model"], "risk": t["risk"], "title": t["title"], **extra}
+    save_state(repo, st)
+    signal.signal(signal.SIGTERM, lambda *_: (_kill_child(), _cancelled(repo, st)))
+    signal.signal(signal.SIGINT, lambda *_: (_kill_child(), _cancelled(repo, st)))
+    return st
+
+
+def _cancelled(repo, st):
+    st.update(state="failed", reason="cancelled", detail="cancelado", pid=None, finished=time.time())
+    save_state(repo, st)
+    sys.exit(4)
+
+
+def running_tasks(repo, exclude):
+    out = []
+    for p in (repo / ".agy" / "runs").glob("*/state.json"):
+        try:
+            s = json.loads(p.read_text())
+        except ValueError:
+            continue
+        if s.get("id") != exclude and s.get("state") == "running" and alive(s.get("pid")):
+            out.append(s)
+    return out
+
+
+# ───────────────────────── comandos ─────────────────────────
+
+def prepare(args):
+    repo = repo_root()
+    cfg = load_config(repo)
+    raw = load_task(repo, args.id)
+    t = resolved(raw, cfg)
+    errs = validate(repo, t, args.id)
+    if errs:
+        die("manual inválido:\n  - " + "\n  - ".join(errs))
+    return repo, cfg, t
+
+
+def cmd_run(args):
+    repo, cfg, t = prepare(args)
+    tid = t["id"]
+    prev = load_state(repo, tid)
+    if prev.get("state") == "running" and alive(prev.get("pid")):
+        die(f"{tid} ya está en ejecución (pid {prev['pid']}).")
+    if t["role"] != "implement":
+        return run_oneshot(repo, cfg, t)
+    wt = worktree_path(repo, cfg, tid)
+    if wt.exists() or branch_exists(repo, tid):
+        if not args.restart:
+            die(f"{tid} ya tiene trabajo previo (estado: {prev.get('state', '?')}). "
+                f"Usa `agy-task fix {tid} \"...\"` para corregirlo o `agy-task run {tid} --restart` para empezar de cero.")
+        drop_work(repo, cfg, tid)
+    for other in running_tasks(repo, tid):
+        if other.get("role") == "implement":
+            hit = patterns_overlap(t["allowed"], other.get("allowed", []))
+            if hit and not args.allow_overlap:
+                die(f"choque de alcance con {other['id']} (en ejecución): {hit[0]!r} ↔ {hit[1]!r}. "
+                    "Espera a que termine, separa los alcances, o pasa --allow-overlap.")
+    if git(repo, "rev-parse", "--verify", "-q", "HEAD", check=False).returncode != 0:
+        die("el repositorio no tiene commits: haz un commit inicial antes de delegar.")
+    base = git(repo, "rev-parse", "HEAD").strip()
+    dirty = bool(git(repo, "status", "--porcelain", "--", ".", ":(exclude).agy").strip())
+    shutil.rmtree(run_dir(repo, tid), ignore_errors=True)
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    git(repo, "worktree", "add", "-q", "-b", branch_name(tid), str(wt), base)
+    links = link_deps(repo, wt, cfg["link"])
+    st = begin(repo, t, {"base": base, "worktree": str(wt), "branch": branch_name(tid),
+                         "links": links, "dirty_base": dirty, "allowed": t["allowed"]})
+    if cfg["setup"]:
+        s = run_verify(wt, cfg["setup"], cfg["verify_timeout_min"] * 60, run_dir(repo, tid) / "setup.log", tid)
+        if not s["ok"]:
+            st.update(state="failed", reason="setup", detail=f"falló `{s['command']}` (rc={s['rc']})")
+            return finish(repo, t, st)
+    prompt = implement_prompt(t, wt)
+    (run_dir(repo, tid) / "prompt.txt").write_text(prompt)
+    supervise(repo, t, cfg, st, prompt)
+    finish(repo, t, st)
+
+
+def cmd_fix(args):
+    repo, cfg, t = prepare(args)
+    tid = t["id"]
+    prev = load_state(repo, tid)
+    if t["role"] != "implement":
+        die("fix solo aplica a tareas implement; para explore/review edita el manual y vuelve a ejecutar run.")
+    if prev.get("state") == "running" and alive(prev.get("pid")):
+        die(f"{tid} está en ejecución.")
+    if prev.get("state") not in ("review", "failed", "blocked") or not Path(prev.get("worktree", "/nonexistent")).exists():
+        die(f"{tid} no tiene trabajo corregible (estado: {prev.get('state', 'sin ejecutar')}). Usa run.")
+    st = begin(repo, t, {k: prev[k] for k in ("base", "worktree", "branch", "links", "dirty_base", "allowed")})
+    st.update(attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
+              usage=prev.get("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0}),
+              started=prev.get("started", time.time()), conversation_id=prev.get("conversation_id"))
+    msg = ("Mensaje del supervisor (Claude) sobre tu trabajo en esta tarea:\n\n" + args.message.strip() +
+           "\n\nAplica lo indicado dentro de los archivos permitidos y entrega de nuevo el reporte estructurado.")
+    conv = prev.get("conversation_id")
+    if not conv:  # nunca hubo conversación: se reenvía el manual completo
+        msg = implement_prompt(t, Path(prev["worktree"])) + "\n\n" + msg
+    supervise(repo, t, cfg, st, msg, conversation=conv)
+    finish(repo, t, st)
+
+
+def run_oneshot(repo, cfg, t):
+    tid = t["id"]
+    cwd, prompt = repo, None
+    if t["role"] == "explore":
+        prompt = explore_prompt(t, repo)
+    else:
+        if t["target"] == "working":
+            diff = git(repo, "diff", "HEAD")
+        else:
+            tgt = load_state(repo, t["target"])
+            if not tgt.get("worktree") or not Path(tgt["worktree"]).exists():
+                die(f"la tarea objetivo {t['target']} no tiene un worktree activo que revisar.")
+            cwd = Path(tgt["worktree"])
+            diff = git(cwd, "diff", "--cached", tgt["base"])
+        if not diff.strip():
+            die("no hay cambios que revisar.")
+        prompt = review_prompt(t, diff, cwd)
+        if len(prompt.encode()) > PROMPT_LIMIT:
+            die("el diff es demasiado grande para una sola revisión (>60 KB): divide la tarea.")
+    shutil.rmtree(run_dir(repo, tid), ignore_errors=True)
+    st = begin(repo, t, {})
+    rd = run_dir(repo, tid)
+    (rd / "prompt.txt").write_text(prompt)
+    message, conv = prompt, None
+    before = tree_fingerprint(cwd)
+    st.update(state="failed", reason="no_report", detail="agy no entregó un reporte válido")
+    for _ in range(1 + t["max_fixups"]):
+        st["attempts"] = n = st["attempts"] + 1
+        r = call_agy(cwd, message, t["model"], settings_for(t["role"]), SCHEMAS[t["role"]],
+                     t["timeout_min"] * 60, rd / f"attempt-{n}", conversation=conv)
+        add_usage(st, r)
+        if r["kind"] != "ok":
+            st.update(state="failed", reason=r["kind"], detail=r.get("detail", ""))
+            break
+        env = r["env"]
+        conv = env.get("conversation_id") or conv
+        so = env.get("structured_output")
+        if env.get("denied_actions"):
+            message = ("Tu turno se canceló porque intentaste modificar archivos o ejecutar comandos. Este encargo es "
+                       "de solo lectura: usa únicamente lectura y búsqueda de archivos y entrega el reporte estructurado.")
+            st["detail"] = "agy intentó una acción de escritura o terminal (denegada)"
+            continue
+        if isinstance(so, dict) and so.get("status") in ("done", "blocked"):
+            st["report"] = so
+            st.update(state=so["status"], reason="preguntas" if so["status"] == "blocked" else "", detail="")
+            break
+        message = "No entregaste el reporte estructurado. Responde solo con el reporte."
+    if tree_fingerprint(cwd) != before:  # segunda barrera, por si los permisos de agy cambian de versión
+        st["incidents"].append({"attempt": st["attempts"], "kind": "arbol_modificado_durante_solo_lectura",
+                                "path": f"{cwd} (revisa `git status`; puede ser agy u otra edición en paralelo)"})
+    finish(repo, t, st)
+
+
+def tree_fingerprint(cwd):
+    """Huella del árbol de trabajo, para detectar escrituras durante un encargo de solo lectura."""
+    status = git(cwd, "status", "--porcelain=v1", "-z", "--", ".", ":(exclude).agy")
+    diff = git(cwd, "diff", "HEAD", "--", ".", ":(exclude).agy", check=False).stdout
+    return status + hashlib.sha1(diff.encode()).hexdigest()
+
+
+def need_state(repo, tid):
+    st = load_state(repo, tid)
+    if not st:
+        die(f"{tid} no se ha ejecutado.")
+    return st
+
+
+def cmd_diff(args):
+    repo = repo_root()
+    st = need_state(repo, args.id)
+    wt = Path(st.get("worktree", "/nonexistent"))
+    if not wt.exists():
+        die(f"{args.id} no tiene worktree (estado: {st.get('state')}).")
+    extra = ["--stat"] if args.stat else []
+    paths = ["--", *args.paths] if args.paths else []
+    sys.stdout.write(git(wt, "diff", "--cached", *extra, st["base"], *paths))
+
+
+def cmd_accept(args):
+    repo = repo_root()
+    cfg = load_config(repo)
+    st = need_state(repo, args.id)
+    if st.get("state") != "review":
+        die(f"solo se acepta una tarea en estado review (actual: {st.get('state')}).")
+    if st.get("review_level") == "diff" and not args.reviewed:
+        die(f"esta tarea exige leer el diff (riesgo {st.get('risk')}, incidentes: {len(st.get('incidents', []))}). "
+            f"Ejecuta `agy-task diff {args.id}`, revísalo y repite con --reviewed.")
+    if git(repo, "diff", "--cached", "--quiet", check=False).returncode != 0:
+        die("hay cambios ya preparados (staged) en el proyecto: haz commit o quítalos del índice antes de aceptar.")
+    m = git(repo, "merge", "--squash", st["branch"], check=False)
+    if m.returncode != 0:
+        if git(repo, "ls-files", "-u").strip():
+            git(repo, "reset", "--merge", check=False)
+        die("no se pudo integrar (conflicto con cambios del proyecto):\n" + tail((m.stdout + m.stderr).strip(), 1500) +
+            f"\nEl proyecto quedó como estaba. Opciones: confirma tus cambios locales y reintenta, o `agy-task run {args.id} --restart`.", 3)
+    st.update(state="accepted", finished=time.time())
+    save_state(repo, st)
+    if not args.keep:
+        drop_work(repo, cfg, args.id)
+    print(f"{args.id} aceptada: cambios integrados y preparados (staged) en la rama actual, sin commit.\n"
+          + git(repo, "diff", "--cached", "--stat"))
+
+
+def cmd_reject(args):
+    repo = repo_root()
+    cfg = load_config(repo)
+    st = need_state(repo, args.id)
+    if st.get("state") == "running" and alive(st.get("pid")):
+        die(f"{args.id} está en ejecución: usa `agy-task cancel {args.id}` primero.")
+    drop_work(repo, cfg, args.id)
+    st.update(state="rejected", reason=args.reason or "", finished=time.time())
+    save_state(repo, st)
+    print(f"{args.id} rechazada; worktree y rama eliminados.")
+
+
+def cmd_cancel(args):
+    repo = repo_root()
+    st = need_state(repo, args.id)
+    if st.get("state") == "running" and alive(st.get("pid")):
+        os.kill(int(st["pid"]), signal.SIGTERM)
+        print(f"{args.id}: señal de cancelación enviada.")
+    else:
+        print(f"{args.id} no está en ejecución (estado: {st.get('state')}).")
+
+
+def cmd_result(args):
+    repo = repo_root()
+    p = run_dir(repo, args.id) / "result.md"
+    st = need_state(repo, args.id)
+    if st.get("state") == "running":
+        up = "activo" if alive(st.get("pid")) else "PROCESO MUERTO (usa run --restart)"
+        print(f"{args.id} en ejecución ({up}), intento {st.get('attempts', 0)}, "
+              f"{fmt_secs(time.time() - st['started'])} transcurridos.")
+        sys.exit(0)
+    sys.stdout.write(p.read_text() if p.exists() else f"{args.id}: estado {st.get('state')} (sin result.md)\n")
+
+
+def cmd_status(args):
+    repo = repo_root()
+    tasks = sorted(p.stem for p in (repo / ".agy" / "tasks").glob("*.md"))
+    runs = sorted(p.parent.name for p in (repo / ".agy" / "runs").glob("*/state.json"))
+    ids = tasks + [r for r in runs if r not in tasks]
+    if not ids:
+        print("sin tareas. Crea una con: agy-task new <id> --role implement --title \"...\"")
+        return
+    for tid in ids:
+        st = load_state(repo, tid)
+        state = st.get("state", "pendiente")
+        if state == "running" and not alive(st.get("pid")):
+            state = "running(muerto)"
+        extra = f" ({st['reason']})" if st.get("reason") else ""
+        lvl = f" · revisión: {st['review_level']}" if state == "review" else ""
+        print(f"{tid:<14} {st.get('role', '-'):<10} {state + extra:<26} {st.get('title', '')}{lvl}")
+
+
+def cmd_check(args):
+    repo, cfg, t = prepare(args)
+    print(f"{t['id']}: manual válido · role={t['role']} risk={t['risk']} model={t['model']}")
+    if t["role"] == "implement":
+        print(f"  allowed: {t['allowed']}\n  protected: {t['protected']}\n  verify: {t['verify']}")
+        for other in running_tasks(repo, t["id"]):
+            hit = patterns_overlap(t["allowed"], other.get("allowed", []))
+            if hit:
+                print(f"  aviso: alcance solapado con {other['id']} en ejecución ({hit[0]!r} ↔ {hit[1]!r})")
+
+
+def cmd_new(args):
+    repo = repo_root()
+    if not ID_RE.match(args.id):
+        die(f"id inválido: {args.id!r}")
+    ensure_init(repo)
+    p = task_path(repo, args.id)
+    if p.exists():
+        die(f"ya existe {p.relative_to(repo)}")
+    tpl = (BRIDGE / "templates" / f"{args.role}.md").read_text()
+    p.write_text(tpl.replace("{{id}}", args.id).replace("{{title}}", args.title or "«título corto»")
+                 .replace("{{target}}", args.target or "«id de tarea o working»"))
+    print(p.relative_to(repo))
+
+
+def ensure_init(repo):
+    a = repo / ".agy"
+    (a / "tasks").mkdir(parents=True, exist_ok=True)
+    (a / "runs").mkdir(exist_ok=True)
+    gi = a / ".gitignore"
+    if not gi.exists():
+        gi.write_text("runs/\n")
+    cfg = a / "config.toml"
+    if not cfg.exists():
+        shutil.copy(BRIDGE / "templates" / "config.toml", cfg)
+        return True
+    return False
+
+
+def cmd_init(args):
+    repo = repo_root()
+    created = ensure_init(repo)
+    hints = [(f, c) for f, c in (("package.json", "npm test"), ("pyproject.toml", "pytest -q"),
+                                 ("Cargo.toml", "cargo test"), ("go.mod", "go test ./..."),
+                                 ("pubspec.yaml", "flutter test"), ("Makefile", "make test"))
+             if (repo / f).exists()]
+    print(f".agy/ listo en {repo}" + (" (config.toml creado)" if created else ""))
+    if hints:
+        print("posibles comandos de verificación (confírmalos y ponlos en .agy/config.toml → verify): "
+              + ", ".join(f"{c}  [{f}]" for f, c in hints))
+
+
+def cmd_doctor(args):
+    ok = True
+
+    def line(good, msg):
+        nonlocal ok
+        ok = ok and good
+        print(("✓ " if good else "✗ ") + msg)
+
+    v = subprocess.run([AGY, "--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL) \
+        if shutil.which(AGY) else None
+    line(bool(v and v.returncode == 0), f"agy instalado: {v.stdout.strip() if v else 'no encontrado'}")
+    line(sys.version_info >= (3, 11), f"python {sys.version.split()[0]}")
+    line(bool(shutil.which("git")), "git disponible")
+    for role in ROLES:
+        line((BRIDGE / "rules" / f"{role}.md").exists(), f"reglas del trabajador: {role}")
+    if not (args.probe and ok):
+        sys.exit(0 if ok else 1)
+    # Sondeo en vivo de la contención (consume una pequeña parte de la cuota de agy).
+    base = HOME / "probe"
+    shutil.rmtree(base, ignore_errors=True)
+    ws, outside = base / "ws", base / "outside"
+    ws.mkdir(parents=True)
+    outside.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=ws)
+    (ws / "a.txt").write_text("hola\n")
+    model = DEFAULTS["model_implement"].replace("-high", "-low")
+    schema = {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]}
+
+    def probe(name, prompt, role, mode=None):
+        r = call_agy(ws, prompt, model, settings_for(role), schema, 120, base / name, mode=mode)
+        if r["kind"] != "ok":
+            line(False, f"sondeo {name}: agy falló ({r['kind']}): {r.get('detail', '')[:200]}")
+        return r
+
+    probe("inside", "Sin ejecutar comandos, crea el archivo inside.txt con el texto OK y responde.", "implement", "accept-edits")
+    line((ws / "inside.txt").exists(), "implementador: puede escribir dentro del workspace")
+    r = probe("outside", f"Sin ejecutar comandos, crea el archivo {outside}/escape.txt con el texto OK y responde.",
+              "implement", "accept-edits")
+    line(not (outside / "escape.txt").exists(), "implementador: escritura fuera del workspace denegada")
+    probe("command", "Ejecuta en la terminal el comando: touch cmd.txt  y responde.", "implement", "accept-edits")
+    line(not (ws / "cmd.txt").exists(), "implementador: terminal denegada")
+    r = probe("ro-read", "Lee a.txt y devuelve su contenido exacto en el campo note.", "explore")
+    line("hola" in str((r["env"].get("structured_output") or {}).get("note", "")), "explorador/revisor: puede leer el workspace")
+    probe("ro-new", "Crea el archivo ro.txt con el texto OK y responde.", "explore")
+    line(not (ws / "ro.txt").exists(), "explorador/revisor: crear archivos denegado")
+    probe("ro-edit", "Cambia el contenido de a.txt a ADIOS y responde.", "explore")
+    line((ws / "a.txt").read_text() == "hola\n", "explorador/revisor: editar archivos denegado")
+    probe("ro-cmd", "Ejecuta en la terminal el comando: touch rocmd.txt  y responde.", "explore")
+    line(not (ws / "rocmd.txt").exists(), "explorador/revisor: terminal denegada")
+    shutil.rmtree(base, ignore_errors=True)
+    print("contención verificada." if ok else "LA CONTENCIÓN FALLÓ: no delegues hasta resolverlo (¿cambió la versión de agy?).")
+    sys.exit(0 if ok else 1)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agy-task", description="Ejecutor supervisado de tareas de agy para Claude Code.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_, with_id=True):
+        p = sub.add_parser(name, help=help_)
+        p.set_defaults(fn=fn)
+        if with_id:
+            p.add_argument("id")
+        return p
+
+    add("init", cmd_init, "prepara .agy/ en el proyecto actual", with_id=False)
+    p = add("new", cmd_new, "crea un manual desde la plantilla")
+    p.add_argument("--role", choices=ROLES, default="implement")
+    p.add_argument("--title", default="")
+    p.add_argument("--target", default="")
+    add("check", cmd_check, "valida un manual sin ejecutarlo")
+    p = add("run", cmd_run, "ejecuta la tarea con agy y aplica las compuertas")
+    p.add_argument("--restart", action="store_true", help="descarta el trabajo previo y empieza de cero")
+    p.add_argument("--allow-overlap", action="store_true", help="permite alcance solapado con otra tarea en ejecución")
+    p = add("fix", cmd_fix, "envía una corrección o respuesta a agy y repite las compuertas")
+    p.add_argument("message")
+    add("status", cmd_status, "lista tareas y estados", with_id=False)
+    add("result", cmd_result, "muestra el resultado de una tarea")
+    p = add("diff", cmd_diff, "muestra el diff de una tarea implement")
+    p.add_argument("--stat", action="store_true")
+    p.add_argument("paths", nargs="*")
+    p = add("accept", cmd_accept, "integra el trabajo en la rama actual (staged, sin commit)")
+    p.add_argument("--reviewed", action="store_true", help="declara que leíste el diff (exigido si revisión = diff)")
+    p.add_argument("--keep", action="store_true", help="conserva el worktree y la rama")
+    p = add("reject", cmd_reject, "descarta el trabajo de una tarea")
+    p.add_argument("--reason", default="")
+    add("cancel", cmd_cancel, "cancela una tarea en ejecución")
+    p = add("doctor", cmd_doctor, "comprueba la instalación", with_id=False)
+    p.add_argument("--probe", action="store_true", help="sondea en vivo la contención de agy (usa cuota)")
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

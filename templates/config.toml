@@ -1,0 +1,23 @@
+# Configuración de agy-bridge para este proyecto. Todo es opcional.
+
+# Comandos de verificación por defecto (los ejecuta el supervisor, no agy).
+# Sin al menos uno, las tareas implement no se pueden delegar.
+verify = []                 # p. ej. ["npm test", "npm run lint"]
+
+# Rutas del proyecto que se enlazan (symlink) dentro del worktree de cada tarea,
+# porque git no las copia: dependencias instaladas y archivos locales.
+link = []                   # p. ej. ["node_modules", ".env"]
+
+# Comandos que preparan el worktree antes de verificar (alternativa a link).
+setup = []                  # p. ej. ["npm ci"]
+
+# Modelos de agy por rol (nombres de `agy models`).
+# model_implement = "gemini-4-hydrogen-high"
+# model_explore   = "gemini-4-hydrogen-high"
+# model_review    = "gemini-4-argon-high"
+
+# Límites por defecto.
+# max_fixups = 2            # correcciones automáticas antes de escalar a Claude
+# max_diff_lines = 800      # por encima, la tarea exige lectura del diff
+# timeout_min = 30          # por turno de agy
+# verify_timeout_min = 15   # por comando de verificación

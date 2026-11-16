@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""agy simulado para las pruebas: ejecuta el siguiente paso del guion en $FAKE_AGY_PLAN.
+
+Cada paso: {"write": {ruta: contenido}, "delete": [rutas], "so": {...reporte...},
+            "denied": [...], "status": "SUCCESS", "rc": 0, "stderr": "..."}
+Registra cada llamada (argumentos y cwd) en <plan>.calls.
+"""
+import json
+import os
+import sys
+
+plan_path = os.environ["FAKE_AGY_PLAN"]
+steps = json.load(open(plan_path))
+calls_path = plan_path + ".calls"
+calls = json.load(open(calls_path)) if os.path.exists(calls_path) else []
+argv = sys.argv[1:]
+if argv[:1] == ["--version"]:
+    print("0.0.0-fake")
+    sys.exit(0)
+calls.append({"argv": argv, "cwd": os.getcwd()})
+json.dump(calls, open(calls_path, "w"))
+step = steps[min(len(calls) - 1, len(steps) - 1)]
+
+for path, content in step.get("write", {}).items():
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+for path in step.get("delete", []):
+    os.remove(path)
+
+env = {"conversation_id": "conv-fake", "status": step.get("status", "SUCCESS"), "response": "",
+       "usage": {"input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 0}}
+if "so" in step:
+    env["structured_output"] = step["so"]
+if "denied" in step:
+    env["denied_actions"] = step["denied"]
+if "error" in step:
+    env["error"] = step["error"]
+print(json.dumps(env))
+sys.stderr.write(step.get("stderr", ""))
+sys.exit(step.get("rc", 0))
