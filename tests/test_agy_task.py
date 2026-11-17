@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Pruebas de agy-task con un agy simulado. Ejecutar: python3 tests/test_agy_task.py"""
+"""Pruebas de agy-task con un agy simulado (no llaman al agy real ni gastan cuota).
+
+Ejecutar con Python 3.11 o superior:  python3 tests/test_agy_task.py
+"""
 import json
 import os
 import shutil
 import subprocess
+import signal
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-AGY_TASK = HERE.parent / "bin" / "agy-task"
+AGY_TASK = HERE.parent / "lib" / "agy_task.py"
+LAUNCHER = HERE.parent / "bin" / "agy-task"
 FAKE = HERE / "fake_agy"
 
 DONE = {"status": "done", "summary": "hecho", "files_changed": [], "decisions": [], "questions": []}
 GOOD = "def add(a, b):\n    return a + b\n"
 BAD = "def add(a, b):\n    return a - b\n"
+# Identidad de git para las pruebas: las máquinas de CI no tienen una configurada.
+IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 VERIFY = "python3 -c \"import sys; sys.path.insert(0, 'src'); import calc; assert calc.add(2, 3) == 5\""
 
 
@@ -40,16 +48,27 @@ class Base(unittest.TestCase):
         self.git("-c", "user.name=t", "-c", "user.email=t@t", "add", "-A")
         self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
         self.env = dict(os.environ, AGY_BIN=str(FAKE), AGY_BRIDGE_HOME=str(self.tmp / "home"),
-                        FAKE_AGY_PLAN=str(self.tmp / "plan.json"),
-                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+                        FAKE_AGY_PLAN=str(self.tmp / "plan.json"), **IDENTITY)
         self.cli("init")
         (self.repo / ".agy" / "config.toml").write_text(f"verify = ['''{VERIFY}''']\n")
+        self.containment(ok=True)
+
+    def containment(self, ok=None):
+        """Registro de contención de la versión del agy simulado (None = sin comprobar)."""
+        path = self.tmp / "home" / "containment.json"
+        path.parent.mkdir(exist_ok=True)
+        if ok is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(json.dumps({"agy_version": "0.0.0-fake", "ok": ok}))
+        return path
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def git(self, *a):
-        return subprocess.run(["git", "-C", str(self.repo), *a], capture_output=True, text=True, check=True).stdout
+        return subprocess.run(["git", "-C", str(self.repo), *a], capture_output=True, text=True, check=True,
+                              env=dict(os.environ, **IDENTITY)).stdout
 
     def cli(self, *a, code=0):
         p = subprocess.run([sys.executable, str(AGY_TASK), *a], cwd=self.repo, env=self.env,
@@ -302,6 +321,121 @@ class Implement(Base):
         self.assertIn("choque de alcance", self.cli("run", "T12", code=1))
 
 
+class Containment(Base):
+    PROBE_OK = {"write": {"inside.txt": "OK"}, "so": {"note": "hola"}}
+
+    def test_unverified_agy_is_probed_once_and_then_trusted(self):
+        record = self.containment(ok=None)
+        self.task("C1")
+        self.plan(*[self.PROBE_OK] * 8, {"write": {"src/calc.py": GOOD}, "so": DONE})
+        out = self.cli("run", "C1")
+        self.assertIn("sondeando", out)
+        self.assertEqual(json.loads(record.read_text())["ok"], True)
+        self.assertEqual(len(self.calls()), 9)  # 8 sondeos + la tarea
+        self.assertEqual(self.state("C1")["state"], "review")
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.assertNotIn("sondeando", self.cli("run", "C1", "--restart"))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_broken_containment_blocks_delegation(self):
+        record = self.containment(ok=None)
+        self.task("C2")
+        # Un agy que escribe donde no debe: fuera del workspace y en modo de solo lectura.
+        self.plan({"write": {"inside.txt": "OK", "ro.txt": "OK", "../outside/escape.txt": "OK"}, "so": {"note": "hola"}})
+        out = self.cli("run", "C2", code=4)
+        self.assertIn("la contención de agy 0.0.0-fake falló", out)
+        self.assertIn("escritura fuera del workspace denegada", out)
+        self.assertIn("crear archivos denegado", out)
+        self.assertEqual(json.loads(record.read_text())["ok"], False)
+        self.assertEqual(self.git("worktree", "list").count("\n"), 1)  # no se llegó a delegar
+        self.assertIn("pendiente", self.cli("status"))
+
+    def test_failed_record_is_reprobed_on_explore_too(self):
+        self.containment(ok=False)
+        self.task("C3", role="explore", body="## Objetivo\n¿Dónde se define add?\n")
+        self.plan({"so": {"note": "sin escribir nada"}})  # ni siquiera puede escribir dentro: sigue roto
+        self.assertIn("puede escribir dentro del workspace", self.cli("run", "C3", code=4))
+
+    def test_doctor(self):
+        self.assertIn("contención comprobada para agy 0.0.0-fake", self.cli("doctor"))
+        self.containment(ok=None)
+        self.assertIn("contención sin comprobar", self.cli("doctor"))
+        self.plan(self.PROBE_OK)
+        self.assertIn("contención verificada para agy 0.0.0-fake", self.cli("doctor", "--probe"))
+        self.assertIn("contención comprobada", self.cli("doctor"))
+
+
+class Lifecycle(Base):
+    def test_cancel_stops_agy_and_marks_the_task(self):
+        self.task("L1")
+        self.plan({"sleep": 60, "so": DONE})
+        proc = subprocess.Popen([sys.executable, str(AGY_TASK), "run", "L1"], cwd=self.repo, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        calls = Path(self.env["FAKE_AGY_PLAN"] + ".calls")
+        deadline = time.time() + 20
+        while not calls.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(calls.exists(), "agy nunca llegó a lanzarse")
+        self.assertIn("en ejecución (activo)", self.cli("result", "L1"))
+        self.assertIn("ya está en ejecución", self.cli("run", "L1", code=1))
+        self.assertIn("señal de cancelación enviada", self.cli("cancel", "L1"))
+        self.assertEqual(proc.wait(timeout=30), 4)
+        proc.communicate()
+        st = self.state("L1")
+        self.assertEqual((st["state"], st["reason"]), ("failed", "cancelled"))
+        self.assertIn("no está en ejecución", self.cli("cancel", "L1"))
+
+    def test_failed_result_shows_why_and_changed_files(self):
+        self.task("L2", extra="max_fixups = 0\n")
+        (self.repo / ".agy" / "config.toml").write_text("verify = ['echo motivo-del-fallo-xyz; exit 7']\n")
+        self.plan({"write": {"src/calc.py": BAD}, "so": DONE})
+        out = self.cli("run", "L2", code=3)
+        self.assertIn("final de la verificación fallida:", out)
+        self.assertIn("| motivo-del-fallo-xyz", out)
+        self.assertIn("M src/calc.py", out)
+        self.assertIn("no hay verificación base correcta", out)
+        self.assertEqual(out, self.cli("result", "L2"))  # result reproduce el mismo texto
+
+    def test_accepted_task_cannot_be_rejected(self):
+        self.task("L3")
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.cli("run", "L3")
+        self.cli("accept", "L3")
+        self.assertIn("ya fue aceptada", self.cli("reject", "L3", code=1))
+        self.assertEqual(self.state("L3")["state"], "accepted")
+        self.assertIn("solo se acepta una tarea en estado review", self.cli("accept", "L3", code=1))
+
+    def test_accept_reports_missing_branch(self):
+        self.task("L4")
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.cli("run", "L4")
+        self.git("worktree", "remove", "--force", self.state("L4")["worktree"])
+        self.git("branch", "-D", "agy/L4")
+        self.assertIn("no se encontró el trabajo de L4", self.cli("accept", "L4", code=4))
+
+    def test_setup_failure_is_reported_before_calling_agy(self):
+        (self.repo / ".agy" / "config.toml").write_text(f"verify = ['''{VERIFY}''']\nsetup = ['exit 9']\n")
+        self.task("L5")
+        self.plan({"so": DONE})
+        out = self.cli("run", "L5", code=4)
+        self.assertIn("FAILED (setup)", out)
+        self.assertFalse(Path(self.env["FAKE_AGY_PLAN"] + ".calls").exists())
+
+    def test_stats_and_version(self):
+        self.assertIn("sin ejecuciones registradas", self.cli("stats"))
+        self.task("L6")
+        self.plan({"write": {"src/calc.py": BAD}, "so": DONE}, {"write": {"src/calc.py": GOOD}, "so": DONE})
+        self.cli("run", "L6")
+        self.task("L7", role="explore", body="## Objetivo\n¿Dónde se define add?\n")
+        self.plan({"so": {"status": "blocked", "summary": "no se puede", "questions": ["¿cuál?"], "findings": []}})
+        self.cli("run", "L7", code=2)
+        out = self.cli("stats")
+        self.assertIn("sesiones: 2", out)
+        self.assertRegex(out, r"implement\s+1 sesiones · listas: 1 \(a la primera: 0\)")
+        self.assertRegex(out, r"explore\s+1 sesiones · listas: 0 .* bloqueadas: 1")
+        self.assertRegex(self.cli("--version"), r"^agy-task \d+\.\d+\.\d+\n$")
+
+
 class Validation(Base):
     def check_fails(self, tid, needle, **kw):
         self.task(tid, **kw)
@@ -316,6 +450,17 @@ class Validation(Base):
         self.check_fails("V7", "claves desconocidas", extra="commands = ['ls']\n")  # nunca terminal
         (self.repo / ".agy" / "config.toml").write_text("")
         self.check_fails("V6", "sin verificación automática")
+
+    def test_manual_tolerates_bom_and_leading_blank_lines(self):
+        self.task("V8")
+        path = self.repo / ".agy" / "tasks" / "V8.md"
+        path.write_text("\ufeff\n\n" + path.read_text())
+        self.assertIn("manual válido", self.cli("check", "V8"))
+
+    def test_config_rejects_unknown_keys(self):
+        (self.repo / ".agy" / "config.toml").write_text("verifi = ['x']\n")
+        self.task("V9")
+        self.assertIn("claves desconocidas: verifi", self.cli("check", "V9", code=1))
 
     def test_new_template_is_rejected_until_filled(self):
         self.cli("new", "N1", "--title", "algo")
@@ -356,9 +501,76 @@ class ReadOnlyRoles(Base):
         self.assertIn("[medium] src/calc.py:2", out)
         self.assertIn("return a + b", self.calls()[0]["argv"][-1])  # el diff viaja en el prompt
 
+    def test_review_of_uncommitted_changes(self):
+        (self.repo / "src" / "calc.py").write_text(GOOD)
+        self.task("R2", role="review", extra='target = "working"\n', body="## Objetivo\nRevisar add.\n")
+        self.plan({"so": {"status": "done", "verdict": "approve", "summary": "bien", "questions": [], "issues": []}})
+        out = self.cli("run", "R2")
+        self.assertIn("veredicto: approve", out)
+        call = self.calls()[0]
+        self.assertEqual(call["cwd"], str(self.repo))
+        self.assertIn("+    return a + b", call["argv"][-1])
+
+    def test_review_needs_something_to_review(self):
+        self.task("R3", role="review", extra='target = "working"\n', body="## Objetivo\nRevisar.\n")
+        self.assertIn("no hay cambios que revisar", self.cli("run", "R3", code=1))
+        self.task("R4", role="review", extra='target = "NOPE"\n', body="## Objetivo\nRevisar.\n")
+        self.assertIn("no tiene un worktree activo", self.cli("run", "R4", code=1))
+
+    def test_readonly_retries_after_denied_action(self):
+        self.task("E3", role="explore", body="## Objetivo\n¿Dónde se define add?\n")
+        self.plan({"denied": [{"action": "write_file", "display_name": "Edit"}]},
+                  {"so": {"status": "done", "summary": "en calc", "questions": [], "findings": []}})
+        self.cli("run", "E3")
+        self.assertEqual((self.state("E3")["state"], self.state("E3")["attempts"]), ("done", 2))
+        self.assertIn("solo lectura", self.calls()[1]["argv"][-1])
+
     def test_status_lists_tasks(self):
         self.task("T1")
         self.assertIn("pendiente", self.cli("status"))
+
+
+class ShippedManuals(Base):
+    def test_examples_are_valid_manuals(self):
+        (self.repo / ".agy" / "config.toml").write_text("verify = ['true']\n")
+        for example in sorted((HERE.parent / "examples").glob("[a-z]*.md")):
+            text = example.read_text()
+            tid = text.split('id = "')[1].split('"')[0]
+            (self.repo / ".agy" / "tasks" / f"{tid}.md").write_text(text)
+            self.assertIn("manual válido", self.cli("check", tid), example.name)
+
+    def test_every_role_has_template_and_rules(self):
+        for role in ("implement", "explore", "review"):
+            self.cli("new", f"N-{role}", "--role", role, "--title", "t", "--target", "T-001")
+            self.assertTrue((HERE.parent / "rules" / f"{role}.md").read_text().strip())
+
+
+class Launcher(unittest.TestCase):
+    def test_skips_an_old_python_first_in_path(self):
+        # En macOS el python3 del sistema es 3.9 y suele ir primero en el PATH.
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "python3"
+            old.write_text("#!/bin/sh\nexit 1\n")
+            old.chmod(0o755)
+            real = Path(tmp) / "real"
+            real.mkdir()
+            name = f"python3.{sys.version_info.minor}"
+            (real / name).symlink_to(sys.executable)
+            env = {"PATH": f"{tmp}:{real}:/usr/bin:/bin", "HOME": tmp}
+            p = subprocess.run([str(LAUNCHER), "--version"], capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertRegex(p.stdout, r"^agy-task \d+\.\d+\.\d+")
+            link = Path(tmp) / "enlace"
+            link.symlink_to(LAUNCHER)  # instalado como enlace simbólico, igual que hace install.sh
+            p = subprocess.run([str(link), "--version"], capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_reports_when_no_suitable_python_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "AGY_BRIDGE_PYTHON": "/bin/sh"}
+            p = subprocess.run([str(LAUNCHER), "--version"], capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("no es un Python >= 3.11", p.stderr)
 
 
 class Globs(unittest.TestCase):
