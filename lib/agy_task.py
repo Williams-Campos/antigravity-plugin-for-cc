@@ -32,7 +32,7 @@ try:
 except ImportError:  # Python < 3.11
     sys.exit("agy-task: requiere Python 3.11 o superior (tomllib).")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 BRIDGE = Path(os.path.realpath(__file__)).parent.parent
 AGY = os.environ.get("AGY_BIN", "agy")

@@ -1,5 +1,10 @@
 # Registro de cambios
 
+## 0.3.1 — 2026-11-17
+
+### Añadido
+- Licencia MIT.
+
 ## 0.3.0 — 2026-11-16
 
 ### Añadido
