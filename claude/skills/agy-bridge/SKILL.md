@@ -45,6 +45,7 @@ El manual es la única información que agy tiene. Lo que no decidas tú, lo dec
 | `blocked` | agy tiene preguntas | Responde con `agy-task fix <ID> "..."` |
 | `failed (gates)` | No pasó la verificación tras las correcciones | `fix` con una indicación concreta, `run --restart` con mejor manual, o hazlo tú |
 | `failed (quota/auth/timeout)` | Fallo del ejecutor | Informa al usuario; no reintentes en bucle |
+| `failed (setup)` | Falló la preparación del worktree, antes de llamar a agy | Corrige `setup`/`link` en `.agy/config.toml` y ejecuta `agy-task baseline` |
 | `done` | Reporte de `explore` o `review` listo | Úsalo; verifica por tu cuenta lo que vaya a sostener una decisión importante |
 
 `accept` deja los cambios **preparados (staged) sin commit** en la rama actual. El commit sigue las reglas normales del usuario.
@@ -61,7 +62,7 @@ Cada tarea se verifica sola, en su worktree. Después de aceptar varias tareas, 
 ## Comandos
 
 ```
-agy-task init | baseline | status | doctor [--probe]
+agy-task init | baseline | status | stats | doctor [--probe]
 agy-task new <ID> --role R --title "..." [--target <ID>|working]
 agy-task check|run|result|cancel <ID>      run: --restart, --allow-overlap
 agy-task fix <ID> "mensaje para agy"
@@ -71,6 +72,8 @@ agy-task accept <ID> [--reviewed] [--keep]   ·   agy-task reject <ID> [--reason
 
 Salida de `run`/`fix`: 0 listo · 2 bloqueado · 3 compuertas fallidas · 4 fallo del ejecutor · 10 cuota · 11 autenticación · 12 timeout.
 
+Un resultado `failed (gates)` ya incluye el final de la verificación fallida y los archivos que agy dejó: normalmente no hace falta abrir los registros. `agy-task stats` resume intentos, tiempos y consumo: úsalo para decidir con datos si delegar está rindiendo en este proyecto.
+
 ## Reglas que no se negocian
 
 - Nunca aceptes una tarea que exige `--reviewed` sin haber leído el diff.
@@ -78,5 +81,5 @@ Salida de `run`/`fix`: 0 listo · 2 bloqueado · 3 compuertas fallidas · 4 fall
 - Los incidentes (cambios fuera de alcance, tests modificados) se revierten solos, pero cuentan: dos tareas seguidas con incidentes indican un manual ambiguo; reescríbelo.
 - No lances en paralelo tareas `implement` con `allowed` solapado (el ejecutor lo bloquea).
 - Varias tareas independientes sí pueden ir en paralelo, cada una en segundo plano.
-- Tras actualizar agy, ejecuta `agy-task doctor --probe` antes de delegar: comprueba que la contención sigue funcionando.
+- La contención de agy se comprueba sola una vez por versión de agy, antes de la primera tarea (tarda ~20 s). Si falla, el ejecutor se niega a delegar: informa al usuario, no busques un rodeo.
 - El código del proyecto viaja a Google al delegar. No delegues archivos con secretos.
