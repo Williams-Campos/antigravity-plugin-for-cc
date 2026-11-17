@@ -1,8 +1,9 @@
 # agy-bridge
 
 [![CI](https://github.com/Williams-Campos/antigravity-agent-for-claude-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Williams-Campos/antigravity-agent-for-claude-code/actions/workflows/ci.yml)
-![versión](https://img.shields.io/badge/versión-0.3.0--beta-blue)
+![versión](https://img.shields.io/badge/versión-0.3.1--beta-blue)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
+[![licencia: MIT](https://img.shields.io/badge/licencia-MIT-green)](LICENSE)
 
 **Antigravity (`agy`, Gemini) como trabajador estrictamente supervisado desde Claude Code.**
 
@@ -14,7 +15,7 @@ El objetivo es reservar a Claude para lo que exige criterio (diseño, decisiones
 dejar a agy la ejecución que se puede especificar y verificar.
 
 > **Beta.** Probado en macOS con agy 1.5.8 y 1.5.9, sobre un proyecto Flutter real. Las pruebas
-> automáticas corren además en Linux. Sin licencia definida todavía.
+> automáticas corren además en Linux.
 
 ## Cómo funciona
 
@@ -266,3 +267,9 @@ python3 tests/test_agy_task.py
 En cada proyecto, `agy-task` usa `.agy/tasks/` (manuales), `.agy/config.toml` y `.agy/runs/`
 (estado, registros y `usage.jsonl`; ignorado por git). El historial de cambios está en
 [`CHANGELOG.md`](CHANGELOG.md).
+
+## Licencia
+
+[MIT](LICENSE). agy-bridge es un proyecto independiente, sin relación con Google ni con Anthropic.
+«Antigravity», «Gemini», «Claude» y «Claude Code» son marcas de sus respectivos dueños. El uso de
+agy y de Claude se rige por los términos de cada servicio, y lo que delegues viaja a ellos.
