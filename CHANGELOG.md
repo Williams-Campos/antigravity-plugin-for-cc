@@ -1,55 +1,76 @@
-# Registro de cambios
+# Changelog
+
+All notable changes to this project are documented here. The project follows
+[semantic versioning](https://semver.org/); while it is below 1.0, minor versions may contain
+breaking changes.
+
+## 0.4.0 — 2026-11-17
+
+The project is now public as **Antigravity plugin for Claude Code**
+(`Williams-Campos/antigravity-plugin-for-cc`) and is written entirely in English.
+
+### Changed (breaking)
+- Everything is in English: CLI output, error messages, the rules agy receives, templates,
+  examples, the Claude Code skill and the documentation.
+- Manual sections are now `## Goal`, `## Context`, `## Approach`, `## Acceptance criteria`,
+  `## Out of scope` and `## What to report`. Manuals written for 0.3 must rename `## Objetivo`
+  and `## Criterios de aceptación`, which are required.
+- The review levels are now `summary` and `diff` (previously `resumen` and `diff`).
+- Incident kinds, gate names and the `blocked` reason are now English identifiers:
+  `out_of_scope`, `protected_modified`, `forbidden`, `supervisor_file_modified`,
+  `tree_modified_during_read_only`; gates `turn`, `changes`, `size`, `verify`, `autofix`;
+  reason `questions`.
 
 ## 0.3.1 — 2026-11-17
 
-### Añadido
-- Licencia MIT.
+### Added
+- MIT license.
 
 ## 0.3.0 — 2026-11-16
 
-### Añadido
-- La contención de agy se comprueba sola una vez por versión instalada, antes de delegar. Si
-  falla, el ejecutor se niega a lanzar ninguna tarea. Los ocho sondeos corren en paralelo.
-- Lanzador `bin/agy-task` que localiza un Python 3.11 o superior aunque el `python3` del `PATH`
-  sea más antiguo. `AGY_BRIDGE_PYTHON` permite fijar uno.
-- Comando `stats`: sesiones, intentos, tiempos y consumo a partir de `usage.jsonl`.
+### Added
+- agy's containment is checked automatically once per installed version, before delegating. If
+  it fails, the executor refuses to launch any task. The eight probes run in parallel.
+- `bin/agy-task` launcher that finds a Python 3.11 or newer even when the `python3` on the
+  `PATH` is older. `AGY_BRIDGE_PYTHON` pins a specific one.
+- `stats` command: sessions, attempts, time and usage from `usage.jsonl`.
 - `agy-task --version`.
-- Un resultado `failed (gates)` incluye el final de la verificación fallida y los archivos que
-  dejó agy.
-- Integración continua en Linux y macOS, ejemplos de manuales y este registro.
+- A `failed (gates)` result includes the tail of the failed verification and the files agy left.
+- Continuous integration on Linux and macOS, example manuals and this changelog.
 
-### Cambiado
-- El ejecutor se reorganizó en `lib/agy_task.py`, con una sola vía para lanzar procesos.
-- `cancel` detiene también los comandos de verificación en curso, no solo a agy.
-- `accept` muestra solo los archivos de la tarea aceptada.
+### Changed
+- The executor was reorganised into `lib/agy_task.py`, with a single path for launching
+  processes.
+- `cancel` also stops verification commands in progress, not only agy.
+- `accept` shows only the files of the accepted task.
 
-### Corregido
-- `reject` ya no permite marcar como rechazada una tarea aceptada.
-- `accept` avisa con claridad si la rama de la tarea ya no existe.
-- El manual admite BOM y líneas en blanco antes de la cabecera.
+### Fixed
+- `reject` no longer allows marking an accepted task as rejected.
+- `accept` reports clearly when the task's branch no longer exists.
+- Manuals may start with a BOM or blank lines before the header.
 
 ## 0.2.0 — 2026-11-16
 
-Ajustes tras la primera prueba en un proyecto real (Flutter).
+Adjustments after the first trial on a real (Flutter) project.
 
-### Añadido
-- `autofix`: el ejecutor aplica el formateador tras cada turno, porque agy no tiene terminal.
-- `seed`: archivos sin commit (pruebas escritas por Claude) llegan al worktree, agy no puede
-  modificarlos y no entran en su diff.
-- `search`: el ejecutor adjunta búsquedas de texto exacto, porque agy no tiene buscador.
-- `baseline`: comprueba la verificación en un worktree limpio, sin gastar cuota.
+### Added
+- `autofix`: the executor runs the formatter after every turn, because agy has no terminal.
+- `seed`: uncommitted files (tests written by Claude) reach the worktree; agy cannot modify them
+  and they stay out of its diff.
+- `search`: the executor attaches exact-text searches, because agy has no search tool.
+- `baseline`: checks verification in a clean worktree without spending quota.
 
-### Cambiado
-- `accept` integra la tarea como parche atómico: se pueden aceptar varias tareas seguidas y
-  conviven con cambios sin commit.
-- El mapa de archivos omite multimedia y binarios.
-- El resultado muestra tiempo de trabajo acumulado, y `usage.jsonl` registra cada sesión.
+### Changed
+- `accept` integrates the task as an atomic patch: several tasks can be accepted in a row and
+  coexist with uncommitted changes.
+- The file map omits media and binary files.
+- The result shows accumulated work time, and `usage.jsonl` records each session.
 
-### Eliminado
-- La detección por fecha de modificación de dependencias enlazadas: daba falsos incidentes con
-  tareas en paralelo, y agy ya deniega escribir a través de enlaces que salen del workspace.
+### Removed
+- Detection of modified linked dependencies by modification time: it produced false incidents
+  with parallel tasks, and agy already denies writes through symlinks that leave the workspace.
 
 ## 0.1.0 — 2026-11-16
 
-Primera versión: ejecutor `agy-task` con los roles `implement`, `explore` y `review`, worktree por
-tarea, compuertas de alcance y verificación, skill para Claude Code e instalador.
+First release: the `agy-task` executor with the `implement`, `explore` and `review` roles, a
+worktree per task, scope and verification gates, a Claude Code skill and an installer.

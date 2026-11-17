@@ -2,14 +2,14 @@
 id = "{{id}}"
 title = "{{title}}"
 role = "explore"
-# allowed = ["src/**"]     # opcional: zonas de interés donde buscar primero
-# search = ["«Nombre»"]    # texto exacto que el ejecutor busca en todo el proyecto y adjunta
+# allowed = ["src/**"]     # optional: areas of interest to look at first
+# search = ["«Name»"]      # exact text the executor searches for across the project and attaches
 # timeout_min = 10
 +++
 
-## Objetivo
-«La pregunta exacta que Claude necesita responder, y para qué decisión la necesita.»
+## Goal
+«The exact question Claude needs answered, and which decision it is needed for.»
 
-## Qué reportar
-- «Dato concreto 1 (p. ej. dónde se define X y quién lo llama)»
-- «Dato concreto 2»
+## What to report
+- «Specific fact 1 (e.g. where X is defined and who calls it)»
+- «Specific fact 2»

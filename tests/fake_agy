@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""agy simulado para las pruebas: ejecuta el siguiente paso del guion en $FAKE_AGY_PLAN.
+"""Fake agy for the tests: runs the next step of the script in $FAKE_AGY_PLAN.
 
-Cada paso es un objeto con claves opcionales:
-  write   {ruta: contenido}  archivos que "agy" escribe (rutas relativas al cwd, o absolutas)
-  delete  [rutas]            archivos que borra
-  so      {...}              reporte estructurado que devuelve
-  denied  [...]              acciones denegadas que declara
-  sleep   segundos           espera antes de responder (para probar cancelación y timeouts)
-  status, rc, stderr, error  para simular fallos del ejecutor
+Each step is an object with optional keys:
+  write   {path: content}    files "agy" writes (paths relative to the cwd, or absolute)
+  delete  [paths]            files it deletes
+  so      {...}              structured report it returns
+  denied  [...]              denied actions it declares
+  sleep   seconds            wait before replying (to test cancellation and timeouts)
+  status, rc, stderr, error  to simulate executor failures
 
-Si hay más llamadas que pasos, se repite el último. Cada llamada (argumentos y cwd) se
-registra en <plan>.calls; el acceso está serializado para soportar llamadas en paralelo.
+If there are more calls than steps, the last step repeats. Every call (arguments and cwd) is
+logged to <plan>.calls; access is serialised so parallel calls are supported.
 """
 import fcntl
 import json

@@ -2,30 +2,30 @@
 id = "{{id}}"
 title = "{{title}}"
 role = "implement"
-risk = "medium"            # low: se acepta con el resumen · medium: Claude lee el diff · high: no se delega
-allowed = ["«src/modulo/**»"]          # únicos archivos que agy puede crear o modificar
-protected = ["«tests/**»"]             # agy no puede tocarlos (tests que definen "correcto")
-# forbidden = []                       # exclusiones dentro de allowed
-# seed = ["«tests/nuevo_test»"]        # archivos tuyos aún sin commit que agy debe ver (no puede cambiarlos)
-# search = ["«NombreDeClase»"]         # texto exacto que el ejecutor busca y adjunta (agy no tiene buscador)
-# verify = ["«comando de test»"]       # si se omite, usa verify de .agy/config.toml
+risk = "medium"            # low: accepted on the summary · medium: Claude reads the diff · high: not delegated
+allowed = ["«src/module/**»"]          # the only files agy may create or modify
+protected = ["«tests/**»"]             # agy may not touch them (tests that define "correct")
+# forbidden = []                       # exclusions inside allowed
+# seed = ["«tests/new_test»"]          # your uncommitted files agy must see (it cannot change them)
+# search = ["«ClassName»"]             # exact text the executor searches for and attaches (agy has no search)
+# verify = ["«test command»"]          # if omitted, uses verify from .agy/config.toml
 # max_fixups = 2
 # max_diff_lines = 800
 # timeout_min = 30
 +++
 
-## Objetivo
-«Qué debe quedar funcionando y para qué, en 2–4 líneas. Comportamiento observable, no pasos.»
+## Goal
+«What must work when this is done, and why, in 2–4 lines. Observable behaviour, not steps.»
 
-## Contexto
-«Dónde vive esto en el código: archivos y funciones que agy debe leer primero, y el patrón existente que debe imitar.»
+## Context
+«Where this lives in the code: files and functions agy must read first, and the existing pattern it must follow.»
 
-## Cómo hacerlo
-«Decisiones ya tomadas: enfoque, nombres, firmas, convenciones. Todo lo que no quieras que agy decida.»
+## Approach
+«Decisions already made: approach, names, signatures, conventions. Everything you do not want agy to decide.»
 
-## Criterios de aceptación
-- «Condición verificable 1 (idealmente un test concreto que debe pasar)»
-- «Condición verificable 2»
+## Acceptance criteria
+- «Verifiable condition 1 (ideally a specific test that must pass)»
+- «Verifiable condition 2»
 
-## Fuera de alcance
-- «Lo que agy NO debe hacer aunque parezca relacionado»
+## Out of scope
+- «What agy must NOT do even if it looks related»

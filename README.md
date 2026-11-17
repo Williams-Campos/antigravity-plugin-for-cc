@@ -1,275 +1,329 @@
-# agy-bridge
+# Antigravity plugin for Claude Code
 
-[![CI](https://github.com/Williams-Campos/antigravity-agent-for-claude-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Williams-Campos/antigravity-agent-for-claude-code/actions/workflows/ci.yml)
-![versión](https://img.shields.io/badge/versión-0.3.1--beta-blue)
+[![CI](https://github.com/Williams-Campos/antigravity-plugin-for-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/Williams-Campos/antigravity-plugin-for-cc/actions/workflows/ci.yml)
+![version](https://img.shields.io/badge/version-0.4.0--beta-blue)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
-[![licencia: MIT](https://img.shields.io/badge/licencia-MIT-green)](LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**Antigravity (`agy`, Gemini) como trabajador estrictamente supervisado desde Claude Code.**
+**Use Antigravity (`agy`, Gemini) as a strictly supervised worker from inside Claude Code.**
 
-Claude decide, escribe un manual por tarea y acepta o rechaza. agy ejecuta aislado: en su propio
-worktree, sin terminal y sin poder escribir fuera de él. Un ejecutor (`agy-task`) aplica compuertas
-automáticas y devuelve un resultado corto, para que Claude no tenga que releer todo el trabajo.
+Claude stays in charge: it decides what to build, writes a short manual for each task, and
+accepts or rejects the result. agy does the work in isolation — in its own git worktree, with
+no terminal and no way to write outside that worktree. An executor, `agy-task`, enforces the
+contract with automatic gates and hands Claude a compact result, so Claude does not have to
+re-read everything agy did.
 
-El objetivo es reservar a Claude para lo que exige criterio (diseño, decisiones, aceptación) y
-dejar a agy la ejecución que se puede especificar y verificar.
+The goal is not to save tokens in general. It is to **reserve Claude for what needs judgment**
+(design, decisions, acceptance) and let agy handle execution that can be specified and verified.
 
-> **Beta.** Probado en macOS con agy 1.5.8 y 1.5.9, sobre un proyecto Flutter real. Las pruebas
-> automáticas corren además en Linux.
+The project ships two pieces:
 
-## Cómo funciona
+- **`agy-task`**, the executor: a single-file Python program with no external dependencies.
+- **The `agy-bridge` skill** for Claude Code, which tells Claude when to delegate, how to write a
+  manual, and what to do with each result.
+
+> **Beta.** Tested on macOS with agy 1.5.8 to 1.5.10, including a real Flutter project. The
+> automated test suite also runs on Linux.
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Guarantees](#guarantees)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Writing a task manual](#writing-a-task-manual)
+- [Task states](#task-states)
+- [Commands](#commands)
+- [Project configuration](#project-configuration)
+- [Security model](#security-model)
+- [Field results](#field-results)
+- [Known limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [License](#license)
+
+## How it works
 
 ```
-Claude escribe .agy/tasks/T-001.md   (manual: objetivo, alcance, criterios, verificación)
+Claude writes .agy/tasks/T-001.md   (manual: goal, scope, acceptance criteria, verification)
         │
 agy-task run T-001
-        ├─ crea un worktree y una rama propios (agy/T-001), fuera del proyecto
-        ├─ lanza agy sin terminal y sin escritura fuera de ese worktree
-        ├─ ejecuta el formateador del proyecto (agy no puede)
-        ├─ revierte y registra todo cambio fuera de alcance o sobre archivos protegidos
-        ├─ ejecuta la verificación (tests, build) por su cuenta; no se fía de agy
-        ├─ si falla, devuelve el error a agy, hasta max_fixups veces
-        └─ escribe un resultado corto: estado, compuertas, incidentes, archivos, resumen
+        ├─ creates a dedicated worktree and branch (agy/T-001), outside the project
+        ├─ launches agy with no terminal and no write access outside that worktree
+        ├─ runs the project's formatter (agy cannot)
+        ├─ reverts and logs any change outside the allowed scope or to protected files
+        ├─ runs verification (tests, build) itself — it never trusts agy's word
+        ├─ on failure, sends the error back to agy, up to max_fixups times
+        └─ writes a short result: state, gates, incidents, files, agy's summary
         │
-Claude lee el resultado  →  accept (staged, sin commit)  ·  fix  ·  reject
+Claude reads the result  →  accept (staged, not committed)  ·  fix  ·  reject
 ```
 
-Hay tres roles:
+There are three roles:
 
-| Rol | Qué hace | Dónde trabaja | Permisos |
+| Role | What it does | Where it works | Permissions |
 |---|---|---|---|
-| `implement` | Escribe código según el manual | Worktree propio | Edita solo dentro del worktree; sin terminal |
-| `explore` | Responde una pregunta sobre el código, con ruta y línea | El proyecto | Solo lectura |
-| `review` | Revisa el diff de una tarea o los cambios sin commit, con otro modelo | Worktree de la tarea o el proyecto | Solo lectura |
+| `implement` | Writes code according to the manual | Its own worktree | Edits only inside the worktree; no terminal |
+| `explore` | Answers a question about the code, citing path and line | The project | Read-only |
+| `review` | Reviews a task's diff, or uncommitted changes, with a different model | The task's worktree or the project | Read-only |
 
-## Garantías
+## Guarantees
 
-| Garantía | Cómo se asegura |
+| Guarantee | How it is enforced |
 |---|---|
-| agy no escribe fuera de su worktree ni usa la terminal | Permisos por sesión de agy, comprobados en vivo una vez por versión de agy antes de delegar |
-| Lo que llega a `review` está dentro de `allowed` y no toca `protected` | El ejecutor revierte cualquier otro cambio y lo registra como incidente |
-| Lo que llega a `review` pasó la verificación | La ejecuta el ejecutor, fuera de agy, sobre el estado ya filtrado |
-| Nada entra en tu rama sin `accept` | agy trabaja en otra rama y otro directorio |
-| `accept` no hace commit ni rompe tu trabajo en curso | Se aplica como parche atómico al índice: entra completo o no toca nada |
-| Las tareas de riesgo no se aceptan a ciegas | Riesgo medio, incidentes o diff grande exigen `accept --reviewed` |
+| agy cannot write outside its worktree or use the terminal | Per-session agy permissions, verified live once per agy version before anything is delegated |
+| Everything that reaches `review` is inside `allowed` and leaves `protected` untouched | The executor reverts any other change and logs it as an incident |
+| Everything that reaches `review` passed verification | The executor runs it, outside agy, on the already filtered tree |
+| Nothing lands on your branch without `accept` | agy works on a different branch, in a different directory |
+| `accept` never commits and never breaks work in progress | It is applied as an atomic patch to the index: all of it or nothing |
+| Risky tasks are not accepted blindly | Medium risk, incidents or a large diff require `accept --reviewed` |
 
-## Requisitos
+## Requirements
 
-- [Antigravity CLI](https://antigravity.google/) (`agy`) instalado y con sesión iniciada.
-- `git` y Python 3.11 o superior (sin dependencias externas).
-- macOS o Linux. En Windows, WSL.
-- El proyecto donde delegues debe ser un repositorio git con al menos un commit.
+- [Antigravity CLI](https://antigravity.google/) (`agy`), installed and signed in.
+- `git` and Python 3.11 or newer (no third-party packages).
+- macOS or Linux. On Windows, use WSL.
+- The project you delegate in must be a git repository with at least one commit.
 
-## Instalación
+## Installation
 
 ```bash
-git clone https://github.com/Williams-Campos/antigravity-agent-for-claude-code.git agy-bridge
+git clone https://github.com/Williams-Campos/antigravity-plugin-for-cc.git
 ```
 
 ```bash
-cd agy-bridge && ./install.sh
+cd antigravity-plugin-for-cc && ./install.sh
 ```
 
-Crea dos enlaces simbólicos: `~/.local/bin/agy-task` y `~/.claude/skills/agy-bridge`. No modifica
-la configuración de Claude Code ni la de agy. Para quitarlos: `./install.sh --uninstall`.
+The installer creates two symlinks — `~/.local/bin/agy-task` and `~/.claude/skills/agy-bridge` — and
+then runs `agy-task doctor`. It does not modify your Claude Code or agy configuration. To remove
+them, run `./install.sh --uninstall`.
 
-`agy-task` localiza por sí mismo un Python adecuado, aunque el `python3` del `PATH` sea más antiguo
-(en macOS suele ser 3.9). Para fijar uno: `export AGY_BRIDGE_PYTHON=/ruta/a/python3`.
+`agy-task` locates a suitable Python on its own, even when the `python3` on your `PATH` is older
+(macOS ships 3.9). To pin one: `export AGY_BRIDGE_PYTHON=/path/to/python3`.
 
-## Primeros pasos
+## Quick start
 
-Una vez por proyecto:
+Once per project:
 
 ```bash
-cd mi-proyecto
-agy-task init        # crea .agy/ y sugiere el comando de verificación
+cd my-project
+agy-task init        # creates .agy/ and suggests a verification command
 $EDITOR .agy/config.toml
-agy-task baseline    # comprueba, sin gastar cuota, que la verificación pasa en un worktree limpio
+agy-task baseline    # checks, without spending quota, that verification passes in a clean worktree
 ```
 
-Por cada tarea:
+For each task:
 
 ```bash
-agy-task new T-001 --role implement --title "Agregar slugify a textutil"
+agy-task new T-001 --role implement --title "Add slugify to textutil"
 $EDITOR .agy/tasks/T-001.md
 agy-task check T-001
 agy-task run T-001
-agy-task diff T-001          # si el resultado lo exige
-agy-task accept T-001        # o: fix "…" / reject
+agy-task diff T-001          # when the result asks for it
+agy-task accept T-001        # or: fix "…" / reject
 ```
 
-Dentro de Claude Code basta con pedirlo («delega esto a agy»): el skill `agy-bridge` le indica
-cuándo delegar, cómo escribir el manual y qué hacer con cada resultado.
+Inside Claude Code you usually do not type any of this. Ask Claude to "delegate this to agy" and
+the `agy-bridge` skill guides it through choosing what to delegate, writing the manual, running the
+task and acting on the result.
 
-## El manual de una tarea
+The first time a task runs with a given agy version, `agy-task` probes agy's containment live
+(about 20 seconds, a small amount of quota). If any probe fails, it refuses to delegate.
 
-Un manual es un archivo Markdown con una cabecera TOML. Hay ejemplos completos en
-[`examples/`](examples/).
+## Writing a task manual
+
+A manual is a Markdown file with a TOML header between `+++` lines. Complete examples for every
+role live in [`examples/`](examples/).
 
 ```markdown
 +++
 id = "T-001"
-title = "Agregar slugify a textutil"
+title = "Add slugify to textutil"
 role = "implement"
 risk = "low"
 allowed = ["src/textutil.py"]
 protected = ["tests/**"]
 +++
 
-## Objetivo
-Agregar `slugify` a `src/textutil.py` para convertir títulos en identificadores aptos para URL.
+## Goal
+Add `slugify` to `src/textutil.py` to turn titles into URL-safe identifiers.
 
-## Contexto
-Lee `src/textutil.py` (estilo del módulo) y `tests/test_slugify.py` (define el comportamiento).
+## Context
+Read `src/textutil.py` (the module's style) and `tests/test_slugify.py` (it defines the behaviour).
 
-## Cómo hacerlo
-- Firma: `slugify(text: str, max_length: int | None = None) -> str`.
-- Solo biblioteca estándar.
+## Approach
+- Signature: `slugify(text: str, max_length: int | None = None) -> str`.
+- Standard library only.
 
-## Criterios de aceptación
-- Todos los tests de `tests/test_slugify.py` pasan sin modificarlos.
+## Acceptance criteria
+- Every test in `tests/test_slugify.py` passes without being modified.
 
-## Fuera de alcance
-- No crear otros archivos.
+## Out of scope
+- Do not create other files.
 ```
 
-| Campo | Roles | Significado |
+| Field | Roles | Meaning |
 |---|---|---|
-| `id`, `title` | todos | Identificador (igual al nombre del archivo) y título corto |
-| `role` | todos | `implement`, `explore` o `review` |
-| `risk` | implement | `low`: se puede aceptar con el resumen · `medium`: exige leer el diff · `high`: no se delega |
-| `allowed` | implement, explore | Únicos archivos que agy puede tocar. En `explore`, zonas de interés |
-| `protected` | implement | Archivos que definen qué es correcto (tests). agy no puede cambiarlos |
-| `forbidden` | implement | Exclusiones dentro de `allowed` |
-| `seed` | implement | Archivos tuyos aún sin commit que agy debe ver, p. ej. una prueba recién escrita. No puede cambiarlos y no entran en su diff |
-| `search` | todos | Textos exactos que el ejecutor busca en el proyecto y adjunta al prompt |
-| `verify` | implement | Comandos de verificación. Si se omite, usa los de `config.toml` |
-| `target` | review | Id de la tarea a revisar, o `"working"` para los cambios sin commit |
-| `model`, `max_fixups`, `max_diff_lines`, `timeout_min` | todos | Sustituyen los valores por defecto del proyecto |
+| `id`, `title` | all | Identifier (must match the file name) and a short title |
+| `role` | all | `implement`, `explore` or `review` |
+| `risk` | implement | `low`: may be accepted on the summary · `medium`: the diff must be read · `high`: never delegated |
+| `allowed` | implement, explore | The only files agy may touch. For `explore`, the areas of interest |
+| `protected` | implement | Files that define what is correct (tests). agy cannot change them |
+| `forbidden` | implement | Exclusions inside `allowed` |
+| `seed` | implement | Your uncommitted files that agy must see, e.g. a test you just wrote. agy cannot change them and they stay out of its diff |
+| `search` | all | Exact strings the executor searches for across the project and attaches to the prompt (up to 8) |
+| `verify` | implement | Verification commands. Defaults to the ones in `config.toml` |
+| `target` | review | Id of the task to review, or `"working"` for the project's uncommitted changes |
+| `model`, `max_fixups`, `max_diff_lines`, `timeout_min` | all | Override the project defaults |
 
-Secciones obligatorias: `## Objetivo` siempre, y `## Criterios de aceptación` en `implement`.
+Required sections: `## Goal` always, plus `## Acceptance criteria` for `implement`. Templates
+created by `agy-task new` mark every blank with `«…»`; a manual that still contains one is
+rejected until it is filled in.
 
-## Estados
+Paths in `allowed`, `protected`, `forbidden` and `seed` are relative to the repository root.
+`**` matches across directories, `*` and `?` do not, and a directory covers everything below it.
 
-| Estado | Significado | Qué hacer |
+## Task states
+
+| State | Meaning | What to do |
 |---|---|---|
-| `review` · revisión `resumen` | Pasó las compuertas; riesgo bajo y sin incidentes | `accept` |
-| `review` · revisión `diff` | Pasó las compuertas; riesgo medio, incidentes o diff grande | `diff`, leerlo, `accept --reviewed` |
-| `blocked` | agy tiene preguntas o el contrato no se puede cumplir | `fix "respuesta"` |
-| `failed (gates)` | No pasó la verificación tras las correcciones | `fix "indicación"`, `run --restart` o hacerlo a mano |
-| `failed (setup)` | Falló la preparación del worktree | Corregir `setup`/`link` y repetir `baseline` |
-| `failed (quota·auth·timeout)` | Fallo de agy | Esperar, iniciar sesión o ampliar `timeout_min` |
-| `done` | Reporte de `explore` o `review` listo | Usarlo |
-| `accepted`, `rejected` | Cerradas | — |
+| `review` · review `summary` | Passed the gates; low risk and no incidents | `accept` |
+| `review` · review `diff` | Passed the gates; medium risk, incidents or a large diff | `diff`, read it, `accept --reviewed` |
+| `blocked` | agy has questions, or the contract cannot be met | `fix "answer"` |
+| `failed (gates)` | Did not pass verification after the fix-up rounds | `fix "hint"`, `run --restart`, or do it by hand |
+| `failed (setup)` | Preparing the worktree failed | Fix `setup`/`link` and run `baseline` again |
+| `failed (quota·auth·timeout)` | agy failed | Wait, sign in again, or raise `timeout_min` |
+| `done` | `explore` or `review` report ready | Use it |
+| `accepted`, `rejected` | Closed | — |
 
-## Comandos
+## Commands
 
-| Comando | Descripción |
+| Command | Description |
 |---|---|
-| `init` | Prepara `.agy/` en el proyecto |
-| `baseline` | Ejecuta la verificación sobre el último commit, sin agy |
-| `new <id> --role … --title …` | Crea un manual desde la plantilla |
-| `check <id>` | Valida un manual sin ejecutarlo |
-| `run <id> [--restart] [--allow-overlap]` | Ejecuta la tarea y aplica las compuertas |
-| `fix <id> "mensaje"` | Envía una corrección o respuesta a agy y repite las compuertas |
-| `result <id>` | Muestra el resultado, o el progreso si sigue en curso |
-| `diff <id> [--stat] [rutas…]` | Muestra el diff de una tarea |
-| `accept <id> [--reviewed] [--keep]` | Integra el trabajo en la rama actual, staged y sin commit |
-| `reject <id> [--reason …]` | Descarta el trabajo: borra worktree y rama |
-| `cancel <id>` | Cancela una tarea en ejecución |
-| `status` | Lista tareas y estados |
-| `stats` | Resume sesiones, intentos, tiempos y consumo |
-| `doctor [--probe]` | Comprueba la instalación; con `--probe`, sondea la contención en vivo |
+| `init` | Set up `.agy/` in the project |
+| `baseline` | Run verification on the last commit, without agy |
+| `new <id> --role … --title …` | Create a manual from the template |
+| `check <id>` | Validate a manual without running it |
+| `run <id> [--restart] [--allow-overlap]` | Run the task and apply the gates |
+| `fix <id> "message"` | Send a correction or answer to agy and run the gates again |
+| `result <id>` | Show the result, or the progress while it is still running |
+| `diff <id> [--stat] [paths…]` | Show a task's diff |
+| `accept <id> [--reviewed] [--keep]` | Integrate the work into the current branch, staged and not committed |
+| `reject <id> [--reason …]` | Discard the work: removes the worktree and the branch |
+| `cancel <id>` | Cancel a running task, including any verification in progress |
+| `status` | List tasks and their states |
+| `stats` | Summarise sessions, attempts, time and usage |
+| `doctor [--probe]` | Check the installation; with `--probe`, probe containment live |
 
-Códigos de salida de `run` y `fix`: `0` listo · `1` uso o manual inválido · `2` bloqueado ·
-`3` compuertas fallidas · `4` fallo del ejecutor · `10` cuota · `11` autenticación · `12` timeout.
+Exit codes of `run` and `fix`: `0` ready · `1` usage error or invalid manual · `2` blocked ·
+`3` gates failed · `4` executor failure · `10` quota · `11` authentication · `12` timeout.
 
-## Configuración del proyecto
+## Project configuration
 
-`.agy/config.toml`; todas las claves son opcionales.
+`.agy/config.toml`; every key is optional.
 
-| Clave | Por defecto | Para qué |
+| Key | Default | Purpose |
 |---|---|---|
-| `verify` | `[]` | Comandos que definen «correcto». Sin al menos uno no se delega implementación |
-| `link` | `[]` | Rutas que git no copia al worktree y se enlazan: dependencias instaladas, SDK local |
-| `setup` | `[]` | Comandos que preparan el worktree antes de verificar, p. ej. `npm ci` |
-| `autofix` | `[]` | Formateadores que el ejecutor aplica tras cada turno de agy |
-| `model_implement`, `model_explore` | `gemini-4-hydrogen-high` | Modelo por rol (`agy models`) |
-| `model_review` | `gemini-4-argon-high` | Conviene que sea distinto del que implementa |
-| `max_fixups` | `2` | Correcciones automáticas antes de devolver el control a Claude |
-| `max_diff_lines` | `800` | Por encima, la tarea exige leer el diff |
-| `timeout_min` | `30` | Límite por turno de agy |
-| `verify_timeout_min` | `15` | Límite por comando de verificación |
-| `worktree_root` | `~/.agy-bridge/worktrees` | Dónde se crean los worktrees |
+| `verify` | `[]` | Commands that define "correct". Without at least one, implementation is never delegated |
+| `link` | `[]` | Paths git does not copy into the worktree, symlinked instead: installed dependencies, a local SDK |
+| `setup` | `[]` | Commands that prepare the worktree before verification, e.g. `npm ci` |
+| `autofix` | `[]` | Formatters the executor runs after every agy turn |
+| `model_implement`, `model_explore` | `gemini-4-hydrogen-high` | Model per role (see `agy models`) |
+| `model_review` | `gemini-4-argon-high` | Ideally different from the implementing model |
+| `max_fixups` | `2` | Automatic fix-up rounds before control goes back to Claude |
+| `max_diff_lines` | `800` | Above this, the task requires reading the diff |
+| `timeout_min` | `30` | Limit per agy turn |
+| `verify_timeout_min` | `15` | Limit per verification command |
+| `worktree_root` | `~/.agy-bridge/worktrees` | Where worktrees are created |
 
-## Qué se midió
+In each project, `agy-task` uses `.agy/tasks/` (manuals), `.agy/config.toml` and `.agy/runs/`
+(state, logs and `usage.jsonl`; ignored by git).
 
-Primera prueba en un proyecto Flutter real (unos 190 archivos Dart y 158 pruebas), con
-`bash scripts/check.sh` como verificación: resolución de dependencias, generación de código,
-formato, análisis y pruebas.
+## Security model
 
-| Encargo | Resultado | Tiempo |
+- **Containment is measured, not assumed.** Before the first task with a new agy version, eight
+  live probes check that the implementer can write inside its workspace but not outside it, not
+  through a symlink that leaves it, and not through the terminal; and that explore/review sessions
+  can read but cannot create files, edit files or run commands. The record is kept in
+  `~/.agy-bridge/containment.json`. If any probe fails, nothing is delegated.
+- **agy never gets a terminal.** In agy, allowing a single command such as `command(ls)` also
+  allows redirections, chaining and subshells — in practice, the whole terminal. Instead, the
+  executor gives agy a file map and pre-run `search` results, and runs formatters and
+  verification itself.
+- **Scope is enforced after every turn**, regardless of what agy reports: out-of-scope,
+  forbidden and protected changes are reverted and logged as incidents.
+- **Read-only roles have a second barrier**: the executor fingerprints the working tree before
+  and after the session and flags any change.
+
+## Field results
+
+First trial on a real Flutter project (about 190 Dart files and 158 tests), using
+`bash scripts/check.sh` as verification: dependency resolution, code generation, formatting,
+static analysis and tests.
+
+| Assignment | Result | Time |
 |---|---|---|
-| 2 `explore` en paralelo | Referencias de ruta y línea correctas al contrastarlas con el código | 41 s y 46 s |
-| 2 `implement` en paralelo (pruebas unitarias nuevas, 69 y 77 líneas) | Pasaron todas las compuertas al primer intento | ~1 min de agy + ~4 min de verificación cada una |
-| 2 `review` con otro modelo | Un hallazgo menor y válido, corregido luego con `fix` | ~1 min cada una |
-| Contrato imposible a propósito, con presión para «hacerlo pasar» | `blocked` las dos veces; no intentó tocar lo prohibido | 17 s |
+| 2 `explore` runs in parallel | Path and line references were correct when checked against the code | 41 s and 46 s |
+| 2 `implement` runs in parallel (new unit tests, 69 and 77 lines) | Passed every gate on the first attempt | ~1 min of agy + ~4 min of verification each |
+| 2 `review` runs with a different model | One minor, valid finding, later fixed with `fix` | ~1 min each |
+| A deliberately impossible contract, with pressure to "make it pass" | `blocked` both times; it never tried to touch forbidden files | 17 s |
 
-Es una muestra pequeña, no un benchmark. La lección práctica: el tiempo lo domina la verificación
-del proyecto, no agy, así que conviene lanzar en paralelo las tareas independientes.
+This is a small sample, not a benchmark. The practical lesson: the project's verification
+dominates the total time, not agy, so independent tasks should run in parallel.
 
-## Límites conocidos
+## Known limitations
 
-- **Sin comando de verificación no se delega implementación.** Es deliberado.
-- **agy no tiene terminal, listado de directorios ni búsqueda.** Recibe un mapa de rutas y los
-  resultados de `search`. En agy, permitir un solo comando (`command(ls)`) permite también
-  redirecciones y encadenados, es decir, la terminal entera; por eso no existe esa opción.
-- **El worktree parte del último commit.** Los cambios sin commit no llegan a agy, salvo los
-  archivos listados en `seed`.
-- **La verificación corre en tu máquina, con tus permisos**, y ejecuta el código que escribió agy.
-  Mantén `allowed` estrecho y `risk` honesto.
-- **El código viaja a Google** al delegar. No delegues archivos con secretos.
-- **La cuota depende de tu plan de Google.** Un fallo de cuota termina la tarea con código 10.
-- **Las compuertas prueban que el trabajo cumple el contrato, no que el diseño sea bueno.** Para
-  eso están `risk = "medium"`, la lectura del diff y el rol `review`.
-- **Cada worktree nuevo repite la preparación del proyecto** (instalar, generar código), lo que
-  alarga la verificación.
+- **No verification command, no delegated implementation.** This is deliberate.
+- **agy has no terminal, directory listing or search.** It receives a path map and the
+  `search` results instead.
+- **The worktree starts from the last commit.** Uncommitted changes do not reach agy, except for
+  the files listed in `seed`.
+- **Verification runs on your machine, with your permissions**, and executes the code agy wrote.
+  Keep `allowed` narrow and `risk` honest.
+- **Your code is sent to Google** when you delegate. Do not delegate files that contain secrets.
+- **Quota depends on your Google plan.** A quota failure ends the task with exit code 10.
+- **The gates prove the work meets the contract, not that the design is good.** That is what
+  `risk = "medium"`, reading the diff and the `review` role are for.
+- **Every new worktree repeats the project's preparation** (installing, generating code), which
+  lengthens verification.
 
-## Solución de problemas
+## Troubleshooting
 
-| Síntoma | Causa y solución |
+| Symptom | Cause and fix |
 |---|---|
-| `LA VERIFICACIÓN BASE FALLA` | La verificación no pasa ni sin cambios: falta algo en `link` o `setup`, o el proyecto ya estaba roto. Mira `.agy/runs/_baseline.log` |
-| `la contención de agy X falló` | Esa versión de agy no respeta los permisos esperados. No se delega; repite con `agy-task doctor --probe` |
-| `failed (gates)` repetido en formato o lint | Falta el formateador en `autofix`: agy no puede ejecutarlo |
-| `blocked` porque agy no encuentra un archivo | Da la ruta exacta en el manual o añade el nombre a `search` |
-| `no se pudo integrar` al aceptar | Los archivos de la tarea cambiaron en el proyecto. Confirma o descarta esos cambios, o `run --restart` |
-| `requiere Python 3.11` | Define `AGY_BRIDGE_PYTHON` con la ruta de un Python reciente |
+| `BASELINE VERIFICATION FAILS` | Verification does not pass even without changes: something is missing from `link` or `setup`, or the project was already broken. See `.agy/runs/_baseline.log` |
+| `containment check failed for agy X` | That agy version does not enforce the expected permissions. Nothing is delegated; run `agy-task doctor --probe` again |
+| Repeated `failed (gates)` on formatting or lint | The formatter is missing from `autofix`: agy cannot run it |
+| `blocked` because agy cannot find a file | Give the exact path in the manual, or add the name to `search` |
+| `could not integrate` on accept | The task's files changed in the project. Commit or discard those changes, or `run --restart` |
+| `requires Python 3.11` | Set `AGY_BRIDGE_PYTHON` to the path of a recent Python |
 
-## Desarrollo
+## Development
 
 ```
-bin/agy-task        lanzador: localiza un Python adecuado
-lib/agy_task.py     ejecutor, sin dependencias externas
-rules/              reglas fijas que recibe agy según el rol
-templates/          plantillas de manual y de configuración
-examples/           manuales de ejemplo
-claude/skills/      skill para Claude Code
-tests/              pruebas con un agy simulado
+bin/agy-task        launcher: finds a suitable Python
+lib/agy_task.py     the executor, with no external dependencies
+rules/              fixed rules agy receives for each role
+templates/          manual and configuration templates
+examples/           example manuals
+claude/skills/      the skill for Claude Code
+tests/              tests against a fake agy
 ```
 
-Las pruebas no llaman al agy real ni gastan cuota:
+The test suite never calls the real agy and spends no quota:
 
 ```bash
 python3 tests/test_agy_task.py
 ```
 
-En cada proyecto, `agy-task` usa `.agy/tasks/` (manuales), `.agy/config.toml` y `.agy/runs/`
-(estado, registros y `usage.jsonl`; ignorado por git). El historial de cambios está en
-[`CHANGELOG.md`](CHANGELOG.md).
+Issues and pull requests are welcome. Please keep the executor dependency-free, add a test for
+any behaviour change, and update [`CHANGELOG.md`](CHANGELOG.md).
 
-## Licencia
+## License
 
-[MIT](LICENSE). agy-bridge es un proyecto independiente, sin relación con Google ni con Anthropic.
-«Antigravity», «Gemini», «Claude» y «Claude Code» son marcas de sus respectivos dueños. El uso de
-agy y de Claude se rige por los términos de cada servicio, y lo que delegues viaja a ellos.
+[MIT](LICENSE). This is an independent project, not affiliated with or endorsed by Google or
+Anthropic. "Antigravity", "Gemini", "Claude" and "Claude Code" are trademarks of their respective
+owners. Use of agy and Claude is governed by each service's terms, and whatever you delegate is
+sent to them.
