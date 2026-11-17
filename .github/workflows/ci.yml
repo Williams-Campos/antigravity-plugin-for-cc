@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    name: Pruebas (${{ matrix.os }}, Python ${{ matrix.python }})
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-      - name: Sintaxis de los scripts de shell
+      - name: Shell script syntax
         run: sh -n bin/agy-task && bash -n install.sh
-      - name: Pruebas con agy simulado
+      - name: Tests against a fake agy
         run: python tests/test_agy_task.py

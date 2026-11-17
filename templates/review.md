@@ -2,9 +2,9 @@
 id = "{{id}}"
 title = "{{title}}"
 role = "review"
-target = "{{target}}"      # id de una tarea implement, o "working" para los cambios sin commit del proyecto
+target = "{{target}}"      # id of an implement task, or "working" for the project's uncommitted changes
 # timeout_min = 10
 +++
 
-## Objetivo
-«Qué debía lograr el cambio que se revisa (pega aquí los criterios de aceptación) y en qué debe fijarse el revisor.»
+## Goal
+«What the change under review was supposed to achieve (paste the acceptance criteria here) and what the reviewer should focus on.»

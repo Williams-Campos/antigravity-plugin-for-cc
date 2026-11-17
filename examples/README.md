@@ -1,10 +1,11 @@
-# Ejemplos de manuales
+# Example manuals
 
-Tres manuales completos sobre un mismo cambio pequeño, uno por rol:
+Three complete manuals for the same small change, one per role:
 
-- [`explore.md`](explore.md): entender el código antes de especificar.
-- [`implement.md`](implement.md): el encargo, con el contrato que agy debe cumplir.
-- [`review.md`](review.md): revisión del resultado con otro modelo.
+- [`explore.md`](explore.md): understand the code before writing the specification.
+- [`implement.md`](implement.md): the assignment, with the contract agy must meet.
+- [`review.md`](review.md): a review of the result by a different model.
 
-Para usarlos como punto de partida, cópialos a `.agy/tasks/` de tu proyecto con el nombre de su
-`id` (por ejemplo `.agy/tasks/T-001.md`) y adáptalos. `agy-task check <id>` te dirá si son válidos.
+To use them as a starting point, copy them into your project's `.agy/tasks/`, named after their
+`id` (for example `.agy/tasks/T-001.md`), and adapt them. `agy-task check <id>` tells you whether
+they are valid.

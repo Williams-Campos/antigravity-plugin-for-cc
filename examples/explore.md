@@ -1,15 +1,15 @@
 +++
 id = "E-001"
-title = "Funciones públicas de textutil y su cobertura"
+title = "Public functions of textutil and their test coverage"
 role = "explore"
 allowed = ["src/**", "tests/**"]
 search = ["textutil"]
 +++
 
-## Objetivo
-¿Qué funciones públicas expone `src/textutil.py` y cuáles tienen pruebas? Lo necesito para decidir qué falta cubrir antes de ampliar el módulo.
+## Goal
+Which public functions does `src/textutil.py` expose, and which of them have tests? I need this to decide what is missing coverage before extending the module.
 
-## Qué reportar
-- Cada función pública con su ubicación y su firma.
-- Qué archivo de pruebas la cubre y qué comportamiento comprueba, si existe.
-- Qué comportamiento queda sin ninguna prueba.
+## What to report
+- Each public function with its location and signature.
+- Which test file covers it and what behaviour it checks, if any.
+- Which behaviour has no test at all.

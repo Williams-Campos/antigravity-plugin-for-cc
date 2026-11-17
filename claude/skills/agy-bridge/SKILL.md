@@ -1,85 +1,85 @@
 ---
 name: agy-bridge
-description: Delega trabajo a Antigravity (agy / Gemini) como trabajador estrictamente supervisado, mediante el comando `agy-task`. Úsalo cuando el usuario pida "usar agy", "delegar a agy/Gemini", "que agy lo haga", o cuando haya implementación bien especificada y verificable, exploración amplia de código o una primera revisión que no necesiten el criterio de Claude. Claude decide, escribe el manual y acepta o rechaza; agy ejecuta aislado y sin terminal.
+description: Delegates work to Antigravity (agy / Gemini) as a strictly supervised worker through the `agy-task` command. Use it when the user asks to "use agy", "delegate to agy/Gemini" or "let agy do it", or when there is well-specified, verifiable implementation work, broad code exploration or a first-pass review that does not need Claude's judgment. Claude decides, writes the manual and accepts or rejects; agy works in isolation, without a terminal.
 ---
 
-# agy-bridge — agy como trabajador supervisado
+# agy-bridge — agy as a supervised worker
 
-Tú (Claude) eres la cabeza: decides, especificas y aceptas. agy es el trabajador: ejecuta un manual dentro de un worktree aislado, sin terminal y sin poder escribir fuera de su carpeta. `agy-task` aplica compuertas automáticas y te devuelve un resultado corto. **Tu atención es el recurso escaso: no releas lo que las compuertas ya garantizan.**
+You (Claude) are the lead: you decide, specify and accept. agy is the worker: it carries out a manual inside an isolated worktree, without a terminal and unable to write outside its folder. `agy-task` applies automatic gates and returns a short result. **Your attention is the scarce resource: do not re-read what the gates already guarantee.**
 
-## Cuándo delegar
+## When to delegate
 
-| Delega a agy | Hazlo tú |
+| Delegate to agy | Do it yourself |
 |---|---|
-| Implementación con criterios verificables por un comando (tests, build, lint) | Arquitectura, diseño, requisitos ambiguos |
-| Exploración: "¿dónde y cómo se hace X?" (rol `explore`) | Ediciones pequeñas (< ~30 líneas): el ida y vuelta cuesta más |
-| Tests, migraciones mecánicas, código repetitivo | Código sensible: seguridad, pagos, datos, migraciones de BD |
-| Primera revisión de un diff con otro modelo (rol `review`) | Cualquier cosa sin forma automática de verificarse |
+| Implementation whose acceptance criteria a command can verify (tests, build, lint) | Architecture, design, ambiguous requirements |
+| Exploration: "where and how is X done?" (`explore` role) | Small edits (< ~30 lines): the round trip costs more |
+| Tests, mechanical migrations, boilerplate | Sensitive code: security, payments, data, database migrations |
+| A first-pass review of a diff by a different model (`review` role) | Anything that cannot be verified automatically |
 
-## Flujo
+## Workflow
 
-1. Una vez por proyecto: `agy-task init`, y completa `.agy/config.toml` con el comando de verificación del proyecto (`verify`), las rutas que git no copia (`link`: dependencias, SDK local) y el formateador (`autofix`). Después `agy-task baseline`: comprueba, sin gastar cuota de agy, que la verificación pasa en un worktree limpio. Si falla, nada de lo que delegues podrá pasar.
-2. `agy-task new <ID> --role implement|explore|review --title "..."` y **rellena el manual** en `.agy/tasks/<ID>.md`.
-3. `agy-task check <ID>` hasta que sea válido.
-4. `agy-task run <ID>`. Si puede tardar más de 2 minutos, ejecútalo en segundo plano (Bash con `run_in_background`) y sigue con otra cosa; no hagas polling.
-5. Lee **solo el resultado** que imprime (`agy-task result <ID>` para verlo de nuevo) y decide según el estado.
+1. Once per project: `agy-task init`, then fill in `.agy/config.toml` with the project's verification command (`verify`), the paths git does not copy (`link`: dependencies, a local SDK) and the formatter (`autofix`). Then `agy-task baseline`: it checks, without spending agy quota, that verification passes in a clean worktree. If it fails, nothing you delegate can pass.
+2. `agy-task new <ID> --role implement|explore|review --title "..."` and **fill in the manual** at `.agy/tasks/<ID>.md`.
+3. `agy-task check <ID>` until it is valid.
+4. `agy-task run <ID>`. If it may take more than 2 minutes, run it in the background (Bash with `run_in_background`) and move on to something else; do not poll.
+5. Read **only the result** it prints (`agy-task result <ID>` shows it again) and act on the state.
 
-## Cómo escribir un buen manual (implement)
+## Writing a good manual (implement)
 
-El manual es la única información que agy tiene. Lo que no decidas tú, lo decide agy.
+The manual is the only information agy has. Whatever you do not decide, agy decides.
 
-- **Objetivo**: comportamiento observable, no pasos.
-- **Contexto**: rutas exactas que debe leer y el patrón existente que debe imitar. agy no tiene búsqueda ni listado: recibe un mapa de rutas y los resultados de los términos que pongas en `search` (texto exacto, p. ej. el nombre de una clase).
-- **Cómo hacerlo**: todas las decisiones de diseño ya tomadas (firmas, nombres, librerías permitidas).
-- **Criterios de aceptación**: verificables, con valores concretos. Lo ideal es escribir tú primero las pruebas y listarlas en `seed`: agy las recibe aunque no tengan commit, no puede modificarlas y no entran en su diff. Así el contrato es ejecutable.
-- Si no estás seguro de un valor esperado, dilo en el manual y pide `blocked` en caso de discrepancia, en vez de dejar que agy lo "arregle".
-- **allowed** lo más estrecho posible; **risk** honesto.
-- Una tarea = un cambio coherente. Si no puedes escribir criterios verificables, no la delegues.
+- **Goal**: observable behaviour, not steps.
+- **Context**: exact paths to read and the existing pattern to follow. agy has no search or listing: it receives a path map and the results for the terms you put in `search` (exact text, e.g. a class name).
+- **Approach**: every design decision already made (signatures, names, allowed libraries).
+- **Acceptance criteria**: verifiable, with concrete values. Ideally, write the tests yourself first and list them in `seed`: agy receives them even though they are not committed, cannot modify them, and they stay out of its diff. That makes the contract executable.
+- If you are not sure of an expected value, say so in the manual and ask for `blocked` on any discrepancy, instead of letting agy "fix" it.
+- **allowed** as narrow as possible; **risk** honest.
+- One task = one coherent change. If you cannot write verifiable criteria, do not delegate it.
 
-## Qué hacer con cada estado
+## What to do with each state
 
-| Estado | Significado | Acción |
+| State | Meaning | Action |
 |---|---|---|
-| `review` · revisión `resumen` | Compuertas OK, riesgo bajo, sin incidentes | `agy-task accept <ID>` sin leer el diff |
-| `review` · revisión `diff` | Compuertas OK, pero riesgo medio, incidentes o diff grande | `agy-task diff <ID>`, léelo, luego `accept <ID> --reviewed` |
-| `blocked` | agy tiene preguntas | Responde con `agy-task fix <ID> "..."` |
-| `failed (gates)` | No pasó la verificación tras las correcciones | `fix` con una indicación concreta, `run --restart` con mejor manual, o hazlo tú |
-| `failed (quota/auth/timeout)` | Fallo del ejecutor | Informa al usuario; no reintentes en bucle |
-| `failed (setup)` | Falló la preparación del worktree, antes de llamar a agy | Corrige `setup`/`link` en `.agy/config.toml` y ejecuta `agy-task baseline` |
-| `done` | Reporte de `explore` o `review` listo | Úsalo; verifica por tu cuenta lo que vaya a sostener una decisión importante |
+| `review` · review `summary` | Gates passed, low risk, no incidents | `agy-task accept <ID>` without reading the diff |
+| `review` · review `diff` | Gates passed, but medium risk, incidents or a large diff | `agy-task diff <ID>`, read it, then `accept <ID> --reviewed` |
+| `blocked` | agy has questions | Answer with `agy-task fix <ID> "..."` |
+| `failed (gates)` | Did not pass verification after the fix-up rounds | `fix` with a concrete hint, `run --restart` with a better manual, or do it yourself |
+| `failed (quota/auth/timeout)` | Executor failure | Tell the user; do not retry in a loop |
+| `failed (setup)` | Preparing the worktree failed, before agy was called | Fix `setup`/`link` in `.agy/config.toml` and run `agy-task baseline` |
+| `done` | `explore` or `review` report ready | Use it; verify yourself anything that will support an important decision |
 
-`accept` deja los cambios **preparados (staged) sin commit** en la rama actual. El commit sigue las reglas normales del usuario.
+`accept` leaves the changes **staged, not committed**, on the current branch. Committing follows the user's normal rules.
 
-Cada tarea se verifica sola, en su worktree. Después de aceptar varias tareas, ejecuta una vez la verificación del proyecto sobre el conjunto antes de dar el trabajo por bueno.
+Each task is verified on its own, in its worktree. After accepting several tasks, run the project's verification once on the combined result before calling the work done.
 
-## Patrones que rinden
+## Patterns that pay off
 
-- **Explorar antes de especificar**: un `explore` (20–60 s) te da rutas, líneas y huecos con los que escribir un manual preciso sin leer tú el código. Comprueba dos o tres de sus referencias antes de fiarte.
-- **Paralelo**: lanza a la vez las tareas independientes (cada una en segundo plano). La verificación domina el tiempo, no agy.
-- **Revisión cruzada**: tras un `implement`, un `review` con `target = "<ID>"` usa otro modelo y cuesta ~1 minuto. Si encuentra algo real, pásaselo a agy con `fix`.
-- **Contrato ejecutable**: escribe tú la prueba, ponla en `seed` y deja que agy implemente hasta que pase.
+- **Explore before specifying**: an `explore` run (20–60 s) gives you paths, lines and gaps to write a precise manual without reading the code yourself. Check two or three of its references before trusting it.
+- **Parallel**: launch independent tasks at the same time (each in the background). Verification dominates the time, not agy.
+- **Cross-review**: after an `implement`, a `review` with `target = "<ID>"` uses a different model and takes ~1 minute. If it finds something real, pass it to agy with `fix`.
+- **Executable contract**: write the test yourself, put it in `seed` and let agy implement until it passes.
 
-## Comandos
+## Commands
 
 ```
 agy-task init | baseline | status | stats | doctor [--probe]
 agy-task new <ID> --role R --title "..." [--target <ID>|working]
 agy-task check|run|result|cancel <ID>      run: --restart, --allow-overlap
-agy-task fix <ID> "mensaje para agy"
-agy-task diff <ID> [--stat] [rutas...]
+agy-task fix <ID> "message for agy"
+agy-task diff <ID> [--stat] [paths...]
 agy-task accept <ID> [--reviewed] [--keep]   ·   agy-task reject <ID> [--reason "..."]
 ```
 
-Salida de `run`/`fix`: 0 listo · 2 bloqueado · 3 compuertas fallidas · 4 fallo del ejecutor · 10 cuota · 11 autenticación · 12 timeout.
+Exit codes of `run`/`fix`: 0 ready · 2 blocked · 3 gates failed · 4 executor failure · 10 quota · 11 authentication · 12 timeout.
 
-Un resultado `failed (gates)` ya incluye el final de la verificación fallida y los archivos que agy dejó: normalmente no hace falta abrir los registros. `agy-task stats` resume intentos, tiempos y consumo: úsalo para decidir con datos si delegar está rindiendo en este proyecto.
+A `failed (gates)` result already includes the tail of the failed verification and the files agy left: you usually do not need to open the logs. `agy-task stats` summarises attempts, time and usage: use it to decide, with data, whether delegating is paying off in this project.
 
-## Reglas que no se negocian
+## Non-negotiable rules
 
-- Nunca aceptes una tarea que exige `--reviewed` sin haber leído el diff.
-- Nunca edites a mano el worktree de agy para "ayudarle" a pasar: corrige con `fix` o hazlo tú desde cero.
-- Los incidentes (cambios fuera de alcance, tests modificados) se revierten solos, pero cuentan: dos tareas seguidas con incidentes indican un manual ambiguo; reescríbelo.
-- No lances en paralelo tareas `implement` con `allowed` solapado (el ejecutor lo bloquea).
-- Varias tareas independientes sí pueden ir en paralelo, cada una en segundo plano.
-- La contención de agy se comprueba sola una vez por versión de agy, antes de la primera tarea (tarda ~20 s). Si falla, el ejecutor se niega a delegar: informa al usuario, no busques un rodeo.
-- El código del proyecto viaja a Google al delegar. No delegues archivos con secretos.
+- Never accept a task that requires `--reviewed` without having read the diff.
+- Never edit agy's worktree by hand to "help" it pass: correct it with `fix` or do it yourself from scratch.
+- Incidents (out-of-scope changes, modified tests) are reverted automatically, but they count: two tasks in a row with incidents point to an ambiguous manual; rewrite it.
+- Do not run `implement` tasks with overlapping `allowed` in parallel (the executor blocks it).
+- Several independent tasks may run in parallel, each in the background.
+- agy's containment is checked automatically once per agy version, before the first task (it takes ~20 s). If it fails, the executor refuses to delegate: tell the user, do not look for a workaround.
+- The project's code is sent to Google when you delegate. Do not delegate files that contain secrets.
