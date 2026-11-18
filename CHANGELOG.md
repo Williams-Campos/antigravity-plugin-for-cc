@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The project follows
 [semantic versioning](https://semver.org/); while it is below 1.0, minor versions may contain
 breaking changes.
 
+## 0.5.0 — 2026-11-17
+
+Claude and agy now work as a senior and an experienced junior: Claude analyses, splits the work,
+writes the briefs and validates; agy implements with its full toolset.
+
+### Added
+- **Collaborative mode**, the new default (`mode = "collaborative"`): agy runs with its full
+  toolset — terminal, search, tests — in its own worktree, runs the verification itself and
+  iterates. The executor audits what it delivered instead of reverting it, and still runs the
+  project's verification before Claude accepts.
+- `recommend <ID> "..."`: a non-binding suggestion. agy adopts it (and implements it) or declines
+  it with a reason, reported as `suggestion` in the result.
+- `grill`, in both directions: `grill --file`, `--working` or `--text` has agy challenge Claude's
+  plan, uncommitted changes or a claim (an external check, verdict `sound`/`concerns`/`unsound`
+  with objections and evidence); `grill <ID> "questions"` has agy answer the senior's questions
+  about a delivered task, in its own conversation, without changing it.
+- `reply <ID> "..."` continues an explore, review, grill or answers session; on a grill, agy keeps
+  only the objections that still stand.
+- Every report carries `recommendations`: risks, follow-up work or better approaches agy noticed.
+- Brief v2 template: `Goal`, `Context`, `Decisions`, `Agreements`, `Acceptance criteria`,
+  `Expected output`.
+- `artifacts` config key; Python and Node caches never enter a task's diff.
+- Git coexistence: commits agy makes are folded back into the index; leaving the task branch
+  fails the task with `failed (git)`.
+
+### Changed
+- Default models: Argon high implements and grills; Hydrogen high explores and reviews (a
+  different model than the implementer).
+- Audit notes are recomputed on the final diff, so they describe what Claude would accept.
+- Read-only sessions that change a task's worktree (review, answers) have it restored to the
+  verified commit.
+- The previous behaviour is kept as `mode = "strict"`: no terminal, file map and pre-run
+  searches, out-of-scope changes reverted, containment probed once per agy version (only in this
+  mode). Its rules moved to `rules/strict/`.
+
 ## 0.4.0 — 2026-11-17
 
 The project is now public as **Antigravity plugin for Claude Code**

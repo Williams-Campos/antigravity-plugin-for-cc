@@ -3,11 +3,11 @@ id = "{{id}}"
 title = "{{title}}"
 role = "implement"
 risk = "medium"            # low: accepted on the summary · medium: Claude reads the diff · high: not delegated
-allowed = ["«src/module/**»"]          # the only files agy may create or modify
-protected = ["«tests/**»"]             # agy may not touch them (tests that define "correct")
-# forbidden = []                       # exclusions inside allowed
-# seed = ["«tests/new_test»"]          # your uncommitted files agy must see (it cannot change them)
-# search = ["«ClassName»"]             # exact text the executor searches for and attaches (agy has no search)
+allowed = ["«src/module/**»"]          # agreed area: the files this task is expected to create or modify
+protected = ["«tests/**»"]             # files agy must not modify (they define what is correct)
+# forbidden = []                       # off limits inside or outside the agreed area
+# seed = ["«tests/new_test»"]          # your uncommitted files agy must see (restored if it changes them)
+# search = ["«ClassName»"]             # starting points: exact text worth searching for
 # verify = ["«test command»"]          # if omitted, uses verify from .agy/config.toml
 # max_fixups = 2
 # max_diff_lines = 800
@@ -18,14 +18,17 @@ protected = ["«tests/**»"]             # agy may not touch them (tests that de
 «What must work when this is done, and why, in 2–4 lines. Observable behaviour, not steps.»
 
 ## Context
-«Where this lives in the code: files and functions agy must read first, and the existing pattern it must follow.»
+«Where this lives: files and functions to read first, the existing pattern to follow, anything agy would otherwise lose time discovering.»
 
-## Approach
-«Decisions already made: approach, names, signatures, conventions. Everything you do not want agy to decide.»
+## Decisions
+«What is already decided and not up for discussion: interfaces, names, signatures, libraries, architecture. Everything you leave out is agy's call.»
+
+## Agreements
+«Limits beyond the header, e.g. do not change the public API, no new dependencies, standard library only.»
 
 ## Acceptance criteria
 - «Verifiable condition 1 (ideally a specific test that must pass)»
 - «Verifiable condition 2»
 
-## Out of scope
-- «What agy must NOT do even if it looks related»
+## Expected output
+«Anything you want in the report beyond the defaults, e.g. "list the edge cases you covered". Delete this section if the defaults are enough.»
