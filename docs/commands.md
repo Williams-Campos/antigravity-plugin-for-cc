@@ -31,6 +31,7 @@ agy-task baseline
 | `new <id> [--role …] --title "…" [--target …]` | Create a brief from the template (`--target` for reviews) |
 | `check <id>` | Validate a brief without running it |
 | `run <id> [--restart] [--allow-overlap]` | Run the task and apply the gates. `--restart` discards a previous attempt; `--allow-overlap` permits an agreed area that overlaps another running task |
+| `recheck <id>` | Run the gates again on agy's last delivery, without calling agy: after fixing a configuration or executor problem, or correcting the worktree by hand. If the delivery still does not pass, the task fails and agy gets the correction through `fix` |
 
 ```bash
 agy-task new T-001 --title "Add slugify to textutil"

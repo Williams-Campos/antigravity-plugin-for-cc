@@ -116,6 +116,7 @@ High-risk work is never delegated.
 | `failed (gates)` | Verification still failed after the extra rounds | `fix "hint"`, `run --restart`, or do it by hand |
 | `failed (git)` | agy left its task branch | Inspect the worktree, then usually `run --restart` |
 | `failed (setup)` | Preparing the worktree failed | Fix `setup` or `link`, then run `baseline` again |
+| `failed (executor)` | The executor itself failed after agy delivered; the work is kept | Fix the cause in `detail`, then `recheck` (no agy call) |
 | `failed (quota·auth·timeout)` | agy itself failed | Wait, sign in again, or raise `timeout_min` |
 | `done` | An explore, review, grill or answers report is ready | Use it, or follow up with `reply` |
 | `accepted` · `rejected` | Closed | — |

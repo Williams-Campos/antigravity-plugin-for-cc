@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -38,7 +39,7 @@ try:
 except ImportError:  # Python < 3.11
     sys.exit("agy-task: requires Python 3.11 or newer (tomllib).")
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 BRIDGE = Path(os.path.realpath(__file__)).parent.parent
 AGY = os.environ.get("AGY_BIN", "agy")
@@ -148,11 +149,15 @@ def git_try(cwd, *args, **kw):
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, **kw)
 
 
+class ExecutorError(Exception):
+    """A failure of the executor itself (not of agy, not of verification)."""
+
+
 def git(cwd, *args):
-    """Runs git and returns its output; on failure, exits with an executor error."""
+    """Runs git and returns its output; on failure, raises ExecutorError."""
     p = git_try(cwd, *args)
     if p.returncode != 0:
-        die(f"git {' '.join(args)} failed: {p.stderr.strip() or p.stdout.strip()}", EXIT_EXECUTOR)
+        raise ExecutorError(f"git {' '.join(args)} failed: {p.stderr.strip() or p.stdout.strip()}")
     return p.stdout
 
 
@@ -465,6 +470,7 @@ def prepare(args):
     errs = validate(repo, t, args.id)
     if errs:
         die("invalid brief:\n  - " + "\n  - ".join(errs))
+    skills_block(cfg)  # a missing team skill stops here, before any work starts
     return repo, cfg, t
 
 
@@ -479,7 +485,11 @@ def run_dir(repo, tid):
 
 
 def load_state(repo, tid):
-    return read_json(run_dir(repo, tid) / "state.json")
+    st = read_json(run_dir(repo, tid) / "state.json")
+    if st.get("state") == "running" and not alive(st.get("pid")):  # the executor died without closing
+        st.update(state="failed", reason="executor", pid=None,
+                  detail=st.get("detail") or "the executor stopped before closing the session; agy's work is kept")
+    return st
 
 
 def save_state(repo, st):
@@ -548,6 +558,13 @@ def link_deps(repo, wt, links):
             dst.symlink_to(src, target_is_directory=src.is_dir())
             made.append(rel)
     return made
+
+
+def uncommitted(repo):
+    """Paths with uncommitted changes in the project (tracked or untracked), outside .agy/."""
+    out = git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames",
+              "--", ".", ":(exclude).agy")
+    return {entry[3:] for entry in out.split("\0") if len(entry) > 3}
 
 
 def baseline_ok(repo):
@@ -907,9 +924,11 @@ def restore_seeds(wt, rd, seeds, attempt):
 
 
 def stage(wt, outside, artifacts):
-    """Stages everything except `outside` (linked dependencies, senior's files) and build artifacts."""
-    git(wt, "add", "-A", "--", ".", *[f":(exclude){path}" for path in outside],
-        *[f":(exclude,glob){pat}" for pat in artifacts])
+    """Stages everything except `outside` (linked dependencies, senior's files) and build artifacts.
+    Two steps instead of exclude pathspecs: git aborts `add` when an exclude names a path it already
+    ignores (a gitignored `node_modules` or SDK folder in `link`)."""
+    git(wt, "add", "-A", "--", ".")
+    git(wt, "reset", "-q", "--", *outside, *[f":(glob){pat}" for pat in artifacts])
 
 
 def changed(wt, base):
@@ -1027,12 +1046,8 @@ def restore_worktree(wt, outside):
 
 def supervise(repo, t, cfg, st, message, conversation=None):
     """Loop of agy turn → gates → fix-up. Leaves the final state in st."""
-    wt, base, rd = Path(st["worktree"]), st["base"], run_dir(repo, t["id"])
+    wt, rd = Path(st["worktree"]), run_dir(repo, t["id"])
     mode = st["mode"]
-    free = mode == "collaborative"
-    outside = st.get("links", []) + st.get("seeds", [])  # worktree paths that never enter the diff
-    artifacts = ARTIFACT_GLOBS + cfg["artifacts"]
-    limit = cfg["verify_timeout_min"] * 60
     reason = "gates"
     for _ in range(1 + t["max_fixups"]):
         n = st["attempts"] = st.get("attempts", 0) + 1
@@ -1046,76 +1061,84 @@ def supervise(repo, t, cfg, st, message, conversation=None):
             return
         env = result["env"]
         conversation = st["conversation_id"] = env.get("conversation_id") or conversation
-        if free:
+        if mode == "collaborative":
             notes, on_branch = git_coexistence(wt, head, st["branch"], n)
             st["incidents"] += notes
             if not on_branch:
                 st.update(state="failed", reason="git",
                           detail="agy left the task branch; inspect the worktree before anything else")
                 return
-
-        gates = {}
-        if cfg["autofix"]:  # formatters: normalise the code before verification
-            fixed = run_commands(wt, cfg["autofix"], limit, rd / f"autofix-{n}.log", t["id"])
-            if not fixed["ok"]:
-                gates["autofix"] = {"ok": False, "warning": True,
-                                    "detail": f"`{fixed['command']}` failed (rc={fixed['rc']})"}
-        incidents = restore_seeds(wt, rd, st.get("seeds", []), n)
-        if free:
-            files, st["scope_notes"] = audit_scope(wt, base, t, outside, artifacts, n)
-            notice = (" Note: these files belong to the senior's contract and were restored: "
-                      + ", ".join(i["path"] for i in incidents) + ".") if incidents else ""
-        else:
-            files, out_of_scope = enforce_scope(wt, base, t, outside, artifacts, n)
-            incidents += out_of_scope
-            notice = (" In addition, these changes were reverted because they are outside your scope: "
-                      + ", ".join(f"{i['path']} ({i['kind']})" for i in incidents) + ".") if incidents else ""
-        st["incidents"] += incidents
-
-        denied, report = denied_names(env), valid_report(env)
-        if denied:
-            reason, st["gates"] = "denied", {"turn": {"ok": False, "detail": f"action denied: {denied}"}}
-            message = (f"Your previous turn was cancelled because you attempted an action that is not allowed "
-                       f"({denied}). You have no terminal and no access outside the workspace. Check the current "
-                       "state of the files, complete whatever is missing without that action, and deliver the "
-                       "structured report." + notice)
-            continue
-        if not report:
-            reason, st["gates"] = "no_report", {"turn": {"ok": False, "detail": "no structured report"}}
-            message = ("You did not deliver the structured report. Make sure the task is complete and "
-                       "reply with the report only." + notice)
-            continue
-        st["report"] = report
-        if report["status"] == "blocked":
-            st.update(state="blocked", reason="questions", detail="")
+        reason, message = gate(repo, t, cfg, st, env, n)
+        if message is None:
             return
-
-        reason = "gates"
-        gates["changes"] = {"ok": bool(files), "detail": f"{len(files)} file(s)"}
-        st["gates"] = gates
-        if not files:
-            message = ("You reported 'done' but no change remained in the task's diff." + notice
-                       + " Implement the task, or reply 'blocked' explaining what you need.")
-            continue
-        total = numstat(wt, base)[1]
-        gates["size"] = {"ok": total <= t["max_diff_lines"], "warning": True,
-                         "detail": f"{total}/{t['max_diff_lines']} lines"}
-        verified = run_commands(wt, t["verify"], limit, rd / f"verify-{n}.log", t["id"])
-        # Verification leaves untracked artifacts behind; agy's work is already in the index.
-        git_try(wt, "clean", "-fdq", *[arg for path in outside for arg in ("-e", path)])
-        if verified["ok"]:
-            gates["verify"] = {"ok": True, "detail": f"{verified['commands']} command(s)"}
-            st.pop("verify_tail", None)
-            commit(wt, t)
-            st.update(state="review", reason="", detail="")
-            return
-        gates["verify"] = {"ok": False, "detail": f"`{verified['command']}` failed (rc={verified['rc']})"}
-        st["verify_tail"] = tail(verified["tail"], 1500)
-        message = ("The senior's verification failed.\n"
-                   f"Command: {verified['command']}\nOutput (tail):\n```\n{verified['tail']}\n```\n"
-                   "Fix the implementation. Do not modify the files that define what is correct. "
-                   "Deliver the structured report again." + notice)
     st.update(state="failed", reason=reason, detail="ran out of fix-up attempts")
+
+
+def gate(repo, t, cfg, st, env, n):
+    """The gates on agy's delivery of attempt n. Returns (reason, None) once st holds a final state,
+    or (reason, message) with what to tell agy for another round."""
+    wt, base, rd = Path(st["worktree"]), st["base"], run_dir(repo, t["id"])
+    free = st["mode"] == "collaborative"
+    outside = st.get("links", []) + st.get("seeds", [])  # worktree paths that never enter the diff
+    artifacts = ARTIFACT_GLOBS + cfg["artifacts"]
+    limit = cfg["verify_timeout_min"] * 60
+    gates = {}
+    if cfg["autofix"]:  # formatters: normalise the code before verification
+        fixed = run_commands(wt, cfg["autofix"], limit, rd / f"autofix-{n}.log", t["id"])
+        if not fixed["ok"]:
+            gates["autofix"] = {"ok": False, "warning": True,
+                                "detail": f"`{fixed['command']}` failed (rc={fixed['rc']})"}
+    incidents = restore_seeds(wt, rd, st.get("seeds", []), n)
+    if free:
+        files, st["scope_notes"] = audit_scope(wt, base, t, outside, artifacts, n)
+        notice = (" Note: these files belong to the senior's contract and were restored: "
+                  + ", ".join(i["path"] for i in incidents) + ".") if incidents else ""
+    else:
+        files, out_of_scope = enforce_scope(wt, base, t, outside, artifacts, n)
+        incidents += out_of_scope
+        notice = (" In addition, these changes were reverted because they are outside your scope: "
+                  + ", ".join(f"{i['path']} ({i['kind']})" for i in incidents) + ".") if incidents else ""
+    st["incidents"] += incidents
+
+    denied, report = denied_names(env), valid_report(env)
+    if denied:
+        st["gates"] = {"turn": {"ok": False, "detail": f"action denied: {denied}"}}
+        return "denied", (f"Your previous turn was cancelled because you attempted an action that is not allowed "
+                          f"({denied}). You have no terminal and no access outside the workspace. Check the current "
+                          "state of the files, complete whatever is missing without that action, and deliver the "
+                          "structured report." + notice)
+    if not report:
+        st["gates"] = {"turn": {"ok": False, "detail": "no structured report"}}
+        return "no_report", ("You did not deliver the structured report. Make sure the task is complete and "
+                             "reply with the report only." + notice)
+    st["report"] = report
+    if report["status"] == "blocked":
+        st.update(state="blocked", reason="questions", detail="")
+        return "questions", None
+
+    gates["changes"] = {"ok": bool(files), "detail": f"{len(files)} file(s)"}
+    st["gates"] = gates
+    if not files:
+        return "gates", ("You reported 'done' but no change remained in the task's diff." + notice
+                         + " Implement the task, or reply 'blocked' explaining what you need.")
+    total = numstat(wt, base)[1]
+    gates["size"] = {"ok": total <= t["max_diff_lines"], "warning": True,
+                     "detail": f"{total}/{t['max_diff_lines']} lines"}
+    verified = run_commands(wt, t["verify"], limit, rd / f"verify-{n}.log", t["id"])
+    # Verification leaves untracked artifacts behind; agy's work is already in the index.
+    git_try(wt, "clean", "-fdq", *[arg for path in outside for arg in ("-e", path)])
+    if verified["ok"]:
+        gates["verify"] = {"ok": True, "detail": f"{verified['commands']} command(s)"}
+        st.pop("verify_tail", None)
+        commit(wt, t)
+        st.update(state="review", reason="", detail="")
+        return "", None
+    gates["verify"] = {"ok": False, "detail": f"`{verified['command']}` failed (rc={verified['rc']})"}
+    st["verify_tail"] = tail(verified["tail"], 1500)
+    return "gates", ("The senior's verification failed.\n"
+                     f"Command: {verified['command']}\nOutput (tail):\n```\n{verified['tail']}\n```\n"
+                     "Fix the implementation. Do not modify the files that define what is correct. "
+                     "Deliver the structured report again." + notice)
 
 
 def consult(repo, cfg, t, message, cwd, conversation=None, prev=None):
@@ -1127,48 +1150,51 @@ def consult(repo, cfg, t, message, cwd, conversation=None, prev=None):
     tid = t["id"]
     if prev is None:
         shutil.rmtree(run_dir(repo, tid), ignore_errors=True)
+    if not conversation:
+        message = join_parts([message, skills_block(cfg)])
     st = begin(repo, t, {"mode": mode, "cwd": str(cwd), "guard": t.get("guard", ""), "target": t.get("target", "")})
     if prev:
         usage = prev.get("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0})
         st.update(started=prev.get("started", st["started"]), active_secs=prev.get("active_secs", 0),
                   attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
                   usage=usage, usage_before=dict(usage))
-    rd = run_dir(repo, tid)
-    if not conversation:
-        message = join_parts([message, skills_block(cfg)])
-    (rd / ("prompt.txt" if prev is None else f"reply-{st['attempts'] + 1}.txt")).write_text(message)
-    before = tree_fingerprint(cwd, untracked=not free)
-    st.update(state="failed", reason="no_report", detail="agy did not deliver a valid report")
-    for _ in range(1 + t["max_fixups"]):
-        n = st["attempts"] = st["attempts"] + 1
-        result = call_agy(cwd, message, t["model"], agy_perms(mode, t["role"]), SCHEMAS[t["role"]],
-                          t["timeout_min"] * 60, rd / f"attempt-{n}", conversation)
-        add_usage(st, result)
-        if result["kind"] != "ok":
-            st.update(state="failed", reason=result["kind"], detail=result["detail"])
-            break
-        env = result["env"]
-        conversation = st["conversation_id"] = env.get("conversation_id") or conversation
-        report = valid_report(env)
-        if denied_names(env):
-            st["detail"] = "agy attempted a write or terminal action (denied)"
-            message = ("Your turn was cancelled because you tried to modify files or run commands. This session "
-                       "is read-only: use only your file-reading tool and deliver the structured report.")
-        elif report:
-            st["report"] = report
-            st.update(state=report["status"], reason="questions" if report["status"] == "blocked" else "", detail="")
-            break
-        else:
-            message = "You did not deliver the structured report. Reply with the report only."
-    if tree_fingerprint(cwd, untracked=not free) != before:  # nothing may change during a consultation
-        note = {"attempt": st["attempts"], "kind": "tree_modified_during_read_only",
-                "path": f"{cwd} (check `git status`; it may be agy or another edit made in parallel)"}
-        guard = load_state(repo, t["guard"]) if t.get("guard") else {}
-        if guard.get("state") == "review":
-            restore_worktree(cwd, guard.get("links", []) + guard.get("seeds", []))
-            note["path"] = f"{cwd} (restored to the verified commit of {t['guard']})"
-        st["incidents"].append(note)
-    finish(repo, t, st)
+
+    def work():
+        nonlocal message, conversation
+        rd = run_dir(repo, tid)
+        (rd / ("prompt.txt" if prev is None else f"reply-{st['attempts'] + 1}.txt")).write_text(message)
+        before = tree_fingerprint(cwd, untracked=not free)
+        st.update(state="failed", reason="no_report", detail="agy did not deliver a valid report")
+        for _ in range(1 + t["max_fixups"]):
+            n = st["attempts"] = st["attempts"] + 1
+            result = call_agy(cwd, message, t["model"], agy_perms(mode, t["role"]), SCHEMAS[t["role"]],
+                              t["timeout_min"] * 60, rd / f"attempt-{n}", conversation)
+            add_usage(st, result)
+            if result["kind"] != "ok":
+                st.update(state="failed", reason=result["kind"], detail=result["detail"])
+                break
+            env = result["env"]
+            conversation = st["conversation_id"] = env.get("conversation_id") or conversation
+            report = valid_report(env)
+            if denied_names(env):
+                st["detail"] = "agy attempted a write or terminal action (denied)"
+                message = ("Your turn was cancelled because you tried to modify files or run commands. This session "
+                           "is read-only: use only your file-reading tool and deliver the structured report.")
+            elif report:
+                st["report"] = report
+                st.update(state=report["status"], reason="questions" if report["status"] == "blocked" else "", detail="")
+                break
+            else:
+                message = "You did not deliver the structured report. Reply with the report only."
+        if tree_fingerprint(cwd, untracked=not free) != before:  # nothing may change during a consultation
+            note = {"attempt": st["attempts"], "kind": "tree_modified_during_read_only",
+                    "path": f"{cwd} (check `git status`; it may be agy or another edit made in parallel)"}
+            guard = load_state(repo, t["guard"]) if t.get("guard") else {}
+            if guard.get("state") == "review":
+                restore_worktree(cwd, guard.get("links", []) + guard.get("seeds", []))
+                note["path"] = f"{cwd} (restored to the verified commit of {t['guard']})"
+            st["incidents"].append(note)
+    run_session(repo, t, st, work)
 
 
 def run_readonly(repo, cfg, t):
@@ -1216,6 +1242,18 @@ def begin(repo, t, extra):
     return st
 
 
+def run_session(repo, t, st, work):
+    """Runs a session's work and closes it. An executor failure ends the session as failed (executor),
+    with the worktree and agy's reply kept, never as a dead `running`."""
+    try:
+        work()
+    except Exception as e:  # noqa: BLE001 — any crash must still leave a closed, explained state
+        if not isinstance(e, ExecutorError):
+            traceback.print_exc()
+        st.update(state="failed", reason="executor", detail=str(e) or type(e).__name__)
+    finish(repo, t, st)
+
+
 def all_notes(st):
     return st.get("incidents", []) + st.get("scope_notes", [])
 
@@ -1238,9 +1276,13 @@ def finish(repo, t, st):
     st["review_level"] = review_level(t, st)
     wt = Path(st.get("worktree", "/nonexistent"))
     if t["role"] == "implement" and wt.exists():
-        stats, st["diff_lines"] = numstat(wt, st["base"])
-        st["files"] = [{"status": status, "path": path, "added": stats.get(path, (0, 0))[0],
-                        "deleted": stats.get(path, (0, 0))[1]} for status, path in changed(wt, st["base"])]
+        try:
+            stats, st["diff_lines"] = numstat(wt, st["base"])
+            st["files"] = [{"status": status, "path": path, "added": stats.get(path, (0, 0))[0],
+                            "deleted": stats.get(path, (0, 0))[1]} for status, path in changed(wt, st["base"])]
+            st["overlap"] = sorted({f["path"] for f in st["files"]} & uncommitted(repo))
+        except ExecutorError as e:
+            st.update(state="failed", reason="executor", detail=str(e))
     save_state(repo, st)
     text = render(t, st)
     (run_dir(repo, t["id"]) / "result.md").write_text(text)
@@ -1267,6 +1309,9 @@ def next_step(tid, st):
         return f"answer the questions: agy-task fix {tid} \"<answers>\"  (or fix the brief and run --restart)"
     if state == "blocked":
         return f"answer it: agy-task reply {tid} \"<answers>\"  (or clarify the brief and run it again)"
+    if state == "failed" and role == "implement" and st.get("reason") == "executor":
+        return (f"agy's work is kept in the worktree. Fix the cause in `detail` (often .agy/config.toml), then "
+                f"agy-task recheck {tid} to run the gates again without agy · agy-task fix {tid} \"<hint>\"")
     if state == "failed" and role == "implement":
         return (f"check .agy/runs/{tid}/ (verify-*.log, attempt-*.err); options: agy-task fix {tid} \"<hint>\""
                 f" · agy-task run {tid} --restart · do it yourself · agy-task reject {tid}")
@@ -1294,9 +1339,13 @@ def render(t, st):
            f" · agy tokens: {usage.get('input', 0)} in / {usage.get('output', 0)} out"]
     if st["detail"]:
         out.append(f"detail: {st['detail']}")
-    if st.get("dirty_base"):
-        out.append("note: the project had uncommitted changes at launch; agy worked on the last commit, "
-                   "without them" + (" (except the `seed` files)." if st.get("seeds") else "."))
+    if st.get("overlap"):
+        out.append("warning: these files also have uncommitted changes in the project, so `accept` will refuse "
+                   "until you commit or discard them there: " + ", ".join(st["overlap"]))
+    elif st.get("dirty_base") and st["state"] == "review":
+        out.append("note: agy worked on the last commit, without your uncommitted changes"
+                   + (" (except the `seed` files)" if st.get("seeds") else "")
+                   + "; none of them touch this task's files.")
     if st.get("no_baseline") and st["state"] == "failed":
         out.append("note: no passing baseline verification is recorded; check with `agy-task baseline` "
                    "that verification passes without changes before blaming agy.")
@@ -1369,7 +1418,8 @@ def cmd_run(args):
     has_work = wt.exists() or branch_exists(repo, tid)
     if has_work and not args.restart:
         die(f"{tid} already has previous work (state: {prev.get('state', '?')}). Use `agy-task fix {tid} \"...\"` "
-            f"to correct it or `agy-task run {tid} --restart` to start from scratch.")
+            f"to correct it, `agy-task recheck {tid}` to run the gates again on it, or "
+            f"`agy-task run {tid} --restart` to start from scratch.")
     for other in running_tasks(repo, tid):
         hit = other.get("role") == "implement" and patterns_overlap(t["allowed"], other.get("allowed", []))
         if hit and not args.allow_overlap:
@@ -1391,19 +1441,21 @@ def cmd_run(args):
     st = begin(repo, t, {"mode": cfg["mode"], "base": base, "worktree": str(wt), "branch": branch_name(tid),
                          "links": links, "seeds": t["seed"], "allowed": t["allowed"], "dirty_base": dirty,
                          "no_baseline": not baseline_ok(repo)})
-    if cfg["setup"]:
-        setup = run_commands(wt, cfg["setup"], cfg["verify_timeout_min"] * 60, rd / "setup.log", tid)
-        if not setup["ok"]:
-            st.update(state="failed", reason="setup", detail=f"`{setup['command']}` failed (rc={setup['rc']})")
-            finish(repo, t, st)
-    prompt = join_parts([implement_prompt(t, wt, cfg["mode"], links), skills_block(cfg)])
-    (rd / "prompt.txt").write_text(prompt)
-    supervise(repo, t, cfg, st, prompt)
-    finish(repo, t, st)
+
+    def work():
+        if cfg["setup"]:
+            setup = run_commands(wt, cfg["setup"], cfg["verify_timeout_min"] * 60, rd / "setup.log", tid)
+            if not setup["ok"]:
+                st.update(state="failed", reason="setup", detail=f"`{setup['command']}` failed (rc={setup['rc']})")
+                return
+        prompt = join_parts([implement_prompt(t, wt, cfg["mode"], links), skills_block(cfg)])
+        (rd / "prompt.txt").write_text(prompt)
+        supervise(repo, t, cfg, st, prompt)
+    run_session(repo, t, st, work)
 
 
-def continue_task(args, message, verb):
-    """fix and recommend: one more supervised session on an implement task, in agy's conversation."""
+def resume(args, verb):
+    """Reopens an implement task that has work in its worktree: (repo, cfg, t, prev, st)."""
     repo, cfg, t = prepare(args)
     tid = t["id"]
     prev = load_state(repo, tid)
@@ -1416,18 +1468,48 @@ def continue_task(args, message, verb):
         die(f"{tid} has no work to continue (state: {prev.get('state', 'never run')}). Use run.")
     mode = prev.get("mode", cfg["mode"])
     ensure_containment(dict(cfg, mode=mode))
+    links = prev.get("links", [])
+    if not prev.get("conversation_id") or verb == "recheck":
+        links = sorted(set(links) | set(link_deps(repo, wt, cfg["link"])))  # the config may have changed
     copy_seeds(repo, wt, run_dir(repo, tid), t["seed"])  # Claude may have updated them
-    carried = {k: prev[k] for k in ("base", "worktree", "branch", "links", "allowed", "dirty_base") if k in prev}
-    st = begin(repo, t, {**carried, "mode": mode, "seeds": t["seed"], "no_baseline": prev.get("no_baseline", False)})
+    carried = {k: prev[k] for k in ("base", "worktree", "branch", "allowed", "dirty_base") if k in prev}
+    st = begin(repo, t, {**carried, "mode": mode, "links": links, "seeds": t["seed"],
+                         "no_baseline": prev.get("no_baseline", False)})
     usage = prev.get("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0})
     st.update(started=prev.get("started", st["started"]), active_secs=prev.get("active_secs", 0),
               attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
-              usage=usage, usage_before=dict(usage))
+              usage=usage, usage_before=dict(usage), conversation_id=prev.get("conversation_id"),
+              report=prev.get("report"))
+    return repo, cfg, t, prev, st
+
+
+def continue_task(args, message, verb):
+    """fix and recommend: one more supervised session on an implement task, in agy's conversation."""
+    repo, cfg, t, prev, st = resume(args, verb)
+    wt = Path(st["worktree"])
     conversation = prev.get("conversation_id")
     if not conversation:  # there was never a conversation: resend the whole brief
-        message = join_parts([implement_prompt(t, wt, mode, prev.get("links", [])), skills_block(cfg), message])
-    supervise(repo, t, cfg, st, message, conversation)
-    finish(repo, t, st)
+        message = join_parts([implement_prompt(t, wt, st["mode"], st["links"]), skills_block(cfg), message])
+    run_session(repo, t, st, lambda: supervise(repo, t, cfg, st, message, conversation))
+
+
+def cmd_recheck(args):
+    """Runs the gates again on agy's last delivery, without calling agy: after fixing an executor or
+    configuration problem, or after correcting the worktree by hand."""
+    repo, cfg, t, prev, st = resume(args, "recheck")
+    n = prev.get("attempts", 0)
+    reply = run_dir(repo, t["id"]) / f"attempt-{n}.json"
+    env = _parse_envelope(reply.read_text(errors="replace")) if n and reply.exists() else {}
+    if not valid_report(env):
+        die(f"{t['id']} has no delivery from agy to check again (last attempt: {n}). "
+            f"Use `agy-task fix {t['id']} \"...\"` to have agy deliver.")
+
+    def work():
+        reason, message = gate(repo, t, cfg, st, env, n)
+        if message is not None:  # the delivery does not pass: agy must correct it, which recheck never does
+            st.update(state="failed", reason=reason,
+                      detail=f"the delivery does not pass the gates; send agy the correction with `agy-task fix {t['id']}`")
+    run_session(repo, t, st, work)
 
 
 def cmd_fix(args):
@@ -1625,8 +1707,6 @@ def cmd_status(args):
     for tid in ids:
         st = load_state(repo, tid)
         state = st.get("state", "pending")
-        if state == "running" and not alive(st.get("pid")):
-            state = "running(dead)"
         shown = state + (f" ({st['reason']})" if st.get("reason") else "")
         shown = shown if len(shown) <= 26 else shown[:25] + "…"
         level = f" · review: {st['review_level']}" if state == "review" else ""
@@ -1688,9 +1768,15 @@ def cmd_baseline(args):
     git(repo, "worktree", "add", "-q", "--detach", str(wt), head)
     t0 = time.time()
     try:
-        link_deps(repo, wt, cfg["link"])
+        links = link_deps(repo, wt, cfg["link"])
         result = run_commands(wt, cfg["setup"] + cfg["verify"], cfg["verify_timeout_min"] * 60,
                               runs_dir(repo) / "_baseline.log", tid)
+        if result["ok"]:  # the same staging a delivery goes through, on what setup and verify left behind
+            try:
+                stage(wt, links, ARTIFACT_GLOBS + cfg["artifacts"])
+            except ExecutorError as e:
+                result = {"ok": False, "command": "staging (git add) of the worktree", "rc": "-",
+                          "tail": f"{e}\nCheck `link` and `artifacts` in .agy/config.toml."}
     finally:
         drop_work(repo, cfg, tid)
     secs = round(time.time() - t0, 1)
@@ -1810,6 +1896,7 @@ def main():
     p.add_argument("--allow-overlap", action="store_true", help="allow scope overlapping another running task")
     p = add("fix", cmd_fix, "send an instruction to agy about an implement task and run the gates again")
     p.add_argument("message")
+    add("recheck", cmd_recheck, "run the gates again on agy's last delivery, without calling agy")
     p = add("recommend", cmd_recommend, "send a non-binding suggestion; agy adopts it or explains why not")
     p.add_argument("message")
     p = add("grill", cmd_grill, "interrogate: agy challenges your material, or you question agy about a task",
@@ -1839,7 +1926,10 @@ def main():
     p = add("doctor", cmd_doctor, "check the installation", with_id=False)
     p.add_argument("--probe", action="store_true", help="probe strict-mode containment live (uses quota)")
     args = ap.parse_args()
-    args.fn(args)
+    try:
+        args.fn(args)
+    except ExecutorError as e:
+        die(str(e), EXIT_EXECUTOR)
 
 
 if __name__ == "__main__":

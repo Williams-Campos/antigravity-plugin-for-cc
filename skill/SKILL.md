@@ -62,7 +62,10 @@ When to grill yourself: before committing to an architecture, before a risky ref
 | `failed (git)` | agy left its task branch | Inspect the worktree; usually `run --restart` |
 | `failed (quota/auth/timeout)` | agy failed | Tell the user; do not retry in a loop |
 | `failed (setup)` | Preparing the worktree failed | Fix `setup`/`link` and run `baseline` |
+| `failed (executor)` | The executor itself failed (see `detail`); agy's work is kept in the worktree | Fix the cause (often `.agy/config.toml`), then `recheck <ID>`: the gates run again without calling agy. Never `run --restart` for this: it throws agy's work away |
 | `done` | explore, review, grill or answers report ready | Use it; check two or three of its references before basing an important decision on it |
+
+**Overlap warning:** when the result names files that also have uncommitted changes in the project, `accept` will refuse until the user commits or discards them; tell the user before accepting.
 
 **Audit notes** (collaborative mode) are not failures: they tell you what agy did outside the agreement (`outside_agreed_area`, `protected_modified`, `off_limits_modified`, `agy_committed`…). Judge them: often agy had a good reason, which it gives in `decisions`. Only `.agy/` and `.git/` are restored automatically, and the senior's `seed` files.
 
@@ -79,7 +82,7 @@ When to grill yourself: before committing to an architecture, before a risky ref
 ```
 agy-task init | baseline | status | stats | doctor [--probe]
 agy-task new <ID> --role implement|explore|review --title "..." [--target <ID>|working]
-agy-task check|run|result|cancel <ID>        run: --restart, --allow-overlap
+agy-task check|run|recheck|result|cancel <ID>   run: --restart, --allow-overlap
 agy-task fix|recommend <ID> "message"
 agy-task grill <ID> "questions"  |  agy-task grill --file F | --working | --text "..." [--focus "..."]
 agy-task reply <ID> "message"

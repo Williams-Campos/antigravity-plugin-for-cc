@@ -5,6 +5,8 @@
 | Symptom | Cause and fix |
 |---|---|
 | `BASELINE VERIFICATION FAILS` | Verification does not pass even without agy's changes: something is missing from `link` or `setup`, or the project was already broken. See `.agy/runs/_baseline.log` |
+| `failed (executor)` | The executor failed after agy delivered (`detail` names the command). agy's work is kept: fix the cause, then `agy-task recheck <id>`. Do not use `run --restart`, which discards it |
+| A warning names files with uncommitted changes | Those files changed both in the task and in your working copy. Commit or discard your copy before `accept` |
 | Build artifacts appear in a diff | Add their pattern to `artifacts` in `config.toml` |
 | `failed (git)` | agy switched branches in its worktree. Inspect it with `git -C <worktree> status`, then `run --restart` |
 | Repeated `failed (gates)` on formatting or lint | Add the formatter to `autofix` |

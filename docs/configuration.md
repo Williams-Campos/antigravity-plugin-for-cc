@@ -17,7 +17,7 @@ autofix = ["ruff format ."]
 |---|---|---|
 | `mode` | `"collaborative"` | `collaborative` or `strict` (see [How it works](how-it-works.md#modes)) |
 | `verify` | `[]` | Commands that define "correct". Run by agy while it works and by the executor before Claude accepts |
-| `link` | `[]` | Paths git does not copy into the worktree, symlinked instead: installed dependencies, a local SDK |
+| `link` | `[]` | Paths git does not copy into the worktree, symlinked instead: installed dependencies, a local SDK. Gitignored folders are the usual case and work as is |
 | `setup` | `[]` | Commands that prepare the worktree before agy starts, such as `npm ci` |
 | `autofix` | `[]` | Formatters the executor runs after every agy turn |
 | `artifacts` | `[]` | Extra build artifacts kept out of the diff. Python and Node caches already are |
