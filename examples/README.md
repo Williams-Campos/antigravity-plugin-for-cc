@@ -1,6 +1,6 @@
-# Example manuals
+# Example briefs
 
-Three complete manuals for the same small change, one per role:
+Three complete briefs for the same small change, one per role:
 
 - [`explore.md`](explore.md): understand the code before writing the specification.
 - [`implement.md`](implement.md): the assignment, with the contract agy must meet.

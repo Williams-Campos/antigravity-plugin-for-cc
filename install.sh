@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs (or, with --uninstall, removes) agy-bridge for the current user:
 #   ~/.local/bin/agy-task            → bin/agy-task
-#   ~/.claude/skills/agy-bridge      → claude/skills/agy-bridge
+#   ~/.claude/skills/agy-bridge      → skill/
 # It only creates symlinks; it does not modify the Claude Code or agy configuration.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +22,6 @@ link() { # destination source
 }
 chmod +x "$HERE/bin/agy-task"
 link "$BIN" "$HERE/bin/agy-task"
-link "$SKILL" "$HERE/claude/skills/agy-bridge"
+link "$SKILL" "$HERE/skill"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "note: add ~/.local/bin to your PATH" ;; esac
 "$BIN" doctor

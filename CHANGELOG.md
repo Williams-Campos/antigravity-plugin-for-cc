@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The project follows
 [semantic versioning](https://semver.org/); while it is below 1.0, minor versions may contain
 breaking changes.
 
+## 0.5.1 — 2026-11-17
+
+### Changed
+- Documentation reorganised: a shorter README, with the full guides in `docs/` (how it works,
+  writing a brief, command reference, configuration, troubleshooting, field results) and a
+  `CONTRIBUTING.md`.
+- The Claude Code skill moved from `claude/skills/agy-bridge/` to `skill/`. **Existing installs:
+  run `./install.sh` again** so the skill symlink points to the new location.
+- The CLI and the strict-mode rules say "brief" instead of "manual", matching the documentation.
+
 ## 0.5.0 — 2026-11-17
 
 Claude and agy now work as a senior and an experienced junior: Claude analyses, splits the work,
