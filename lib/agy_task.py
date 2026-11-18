@@ -12,7 +12,7 @@ Besides run/fix, Claude and agy talk through recommend (a non-binding suggestion
 interrogation, in either direction) and reply (continuing a conversation).
 
 Exit codes of run, fix, recommend, grill and reply:
-  0 ready (review or done) · 1 usage error or invalid manual · 2 blocked (agy has questions)
+  0 ready (review or done) · 1 usage error or invalid brief · 2 blocked (agy has questions)
   3 gates failed           · 4 executor failure             · 10 quota · 11 authentication
   12 timeout
 """
@@ -38,19 +38,19 @@ try:
 except ImportError:  # Python < 3.11
     sys.exit("agy-task: requires Python 3.11 or newer (tomllib).")
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 BRIDGE = Path(os.path.realpath(__file__)).parent.parent
 AGY = os.environ.get("AGY_BIN", "agy")
 HOME = Path(os.environ.get("AGY_BRIDGE_HOME", str(Path.home() / ".agy-bridge")))
 
 MODES = ("collaborative", "strict")
-ROLES = ("implement", "explore", "review")  # roles a manual can have
-CONSULT_ROLES = ("grill", "answers")  # sessions started by grill, with no manual
+ROLES = ("implement", "explore", "review")  # roles a brief can have
+CONSULT_ROLES = ("grill", "answers")  # sessions started by grill, with no brief
 ALL_ROLES = ROLES + CONSULT_ROLES
 RISKS = ("low", "medium", "high")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$")
-PLACEHOLDER = "«"  # template marker: a manual that still contains it is not finished
+PLACEHOLDER = "«"  # template marker: a brief that still contains it is not finished
 PROMPT_LIMIT = 60_000  # bytes; agy accepts up to ~64 KB through -p
 IMPLICIT_FORBIDDEN = [".agy/**", ".git/**"]
 PROBE_MODEL = "gemini-4-hydrogen-low"
@@ -316,7 +316,7 @@ def run_commands(cwd, cmds, timeout_s, log_path, tid):
     return {"ok": True, "commands": len(cmds)}
 
 
-# ───────────────────────── configuration and manuals ─────────────────────────
+# ───────────────────────── configuration and briefs ─────────────────────────
 
 def agy_dir(repo):
     return repo / ".agy"
@@ -348,7 +348,7 @@ def load_task(repo, tid):
         die(f"invalid id: {tid!r}")
     path = task_path(repo, tid)
     if not path.exists():
-        die(f"manual {path.relative_to(repo)} does not exist (create it with: agy-task new {tid})")
+        die(f"brief {path.relative_to(repo)} does not exist (create it with: agy-task new {tid})")
     m = re.match(r"\+\+\+\n(.*?)\n\+\+\+[ \t]*\n?(.*)", path.read_text().lstrip("﻿ \n"), re.S)
     if not m:
         die(f"{path.name}: missing the TOML header between '+++' lines.")
@@ -361,7 +361,7 @@ def load_task(repo, tid):
 
 
 def resolved(task, cfg):
-    """The manual with the project defaults applied."""
+    """The brief with the project defaults applied."""
     t = dict(task)
     t.setdefault("role", "implement")
     t.setdefault("risk", "medium")
@@ -377,7 +377,7 @@ def resolved(task, cfg):
 
 
 def validate(repo, t, tid):
-    """Errors that prevent running the manual. An ambiguous manual costs more than not delegating."""
+    """Errors that prevent running the brief. An ambiguous brief costs more than not delegating."""
     errs = []
     unknown = set(t) - TASK_KEYS - {"_body"}
     if unknown:
@@ -410,7 +410,7 @@ def validate(repo, t, tid):
             errs.append(f"{key} must be an integer ≥ 0")
     body = t.get("_body", "")
     if PLACEHOLDER in body or PLACEHOLDER in str(t.get("title", "")):
-        errs.append("the manual still has unfilled «…» template placeholders")
+        errs.append("the brief still has unfilled «…» template placeholders")
     if not section(body, "Goal"):
         errs.append("missing the '## Goal' section")
     if role == "implement":
@@ -420,7 +420,7 @@ def validate(repo, t, tid):
         if not t.get("allowed"):
             errs.append("implement requires 'allowed' (the agreed area: files agy is expected to touch)")
         if not t.get("verify"):
-            errs.append("implement requires 'verify' (in the manual or in .agy/config.toml): "
+            errs.append("implement requires 'verify' (in the brief or in .agy/config.toml): "
                         "without verification Claude cannot accept on a summary")
         if not section(body, "Acceptance criteria"):
             errs.append("missing the '## Acceptance criteria' section")
@@ -432,13 +432,13 @@ def validate(repo, t, tid):
 
 
 def prepare(args):
-    """Repository, configuration and validated manual for the given id."""
+    """Repository, configuration and validated brief for the given id."""
     repo = repo_root()
     cfg = load_config(repo)
     t = resolved(load_task(repo, args.id), cfg)
     errs = validate(repo, t, args.id)
     if errs:
-        die("invalid manual:\n  - " + "\n  - ".join(errs))
+        die("invalid brief:\n  - " + "\n  - ".join(errs))
     return repo, cfg, t
 
 
@@ -587,7 +587,7 @@ def call_agy(cwd, prompt, model, perms, schema, timeout_s, out_base, conversatio
     quota, auth, model, error. The raw output is kept in <out_base>.json and .err."""
     if len(prompt.encode()) > PROMPT_LIMIT:
         return {"kind": "error", "env": {}, "secs": 0,
-                "detail": "the prompt exceeds 60 KB: shorten the manual or split the task"}
+                "detail": "the prompt exceeds 60 KB: shorten the brief or split the task"}
     cmd = [AGY, "--model", model, *perms, "--output-format", "json", "--json-schema", json.dumps(schema),
            "--print-timeout", f"{int(timeout_s)}s", "--disable-slash-commands"]
     if conversation:
@@ -802,7 +802,7 @@ def file_map(cwd, focus, budget=30000):
         counts[key] = counts.get(key, 0) + 1
     summary = _fit([f"{d}/ ({n} files)" for d, n in sorted(counts.items())], budget // 2, lambda rest: "…")
     return (head + ("Work area:\n" + "\n".join(near) + "\n\n" if near else "")
-            + "Rest of the project, per directory (the manual must give you any exact paths you need):\n"
+            + "Rest of the project, per directory (the brief must give you any exact paths you need):\n"
             + "\n".join(summary))
 
 
@@ -819,7 +819,7 @@ def implement_prompt(t, wt, mode, links=()):
             seeds,
             f"You have no terminal. The senior will run these checks when you finish:\n{bullets(t['verify'])}",
             f"Approximate maximum size of the change: {t['max_diff_lines']} lines.",
-            "## Manual",
+            "## Brief",
             t["_body"],
             search_block(wt, t["search"]),
             file_map(wt, t["allowed"]),
@@ -1236,9 +1236,9 @@ def next_step(tid, st):
         return (first + f"\n  also: agy-task fix {tid} \"<order>\" · recommend {tid} \"<suggestion>\" · "
                 f"grill {tid} \"<questions>\" · reject {tid}")
     if state == "blocked" and role == "implement":
-        return f"answer the questions: agy-task fix {tid} \"<answers>\"  (or fix the manual and run --restart)"
+        return f"answer the questions: agy-task fix {tid} \"<answers>\"  (or fix the brief and run --restart)"
     if state == "blocked":
-        return f"answer it: agy-task reply {tid} \"<answers>\"  (or clarify the manual and run it again)"
+        return f"answer it: agy-task reply {tid} \"<answers>\"  (or clarify the brief and run it again)"
     if state == "failed" and role == "implement":
         return (f"check .agy/runs/{tid}/ (verify-*.log, attempt-*.err); options: agy-task fix {tid} \"<hint>\""
                 f" · agy-task run {tid} --restart · do it yourself · agy-task reject {tid}")
@@ -1632,7 +1632,7 @@ def cmd_stats(args):
 
 def cmd_check(args):
     repo, cfg, t = prepare(args)
-    print(f"{t['id']}: valid manual · role={t['role']} risk={t['risk']} model={t['model']} mode={cfg['mode']}")
+    print(f"{t['id']}: valid brief · role={t['role']} risk={t['risk']} model={t['model']} mode={cfg['mode']}")
     if t["role"] != "implement":
         return
     print(f"  allowed: {t['allowed']}\n  protected: {t['protected']}\n  verify: {t['verify']}")
@@ -1770,11 +1770,11 @@ def main():
 
     add("init", cmd_init, "set up .agy/ in the current project", with_id=False)
     add("baseline", cmd_baseline, "check that verification passes on the last commit, without agy", with_id=False)
-    p = add("new", cmd_new, "create a manual from the template")
+    p = add("new", cmd_new, "create a brief from the template")
     p.add_argument("--role", choices=ROLES, default="implement")
     p.add_argument("--title", default="")
     p.add_argument("--target", default="", help="for review: id of the task to review, or 'working'")
-    add("check", cmd_check, "validate a manual without running it")
+    add("check", cmd_check, "validate a brief without running it")
     p = add("run", cmd_run, "run the task with agy and apply the gates")
     p.add_argument("--restart", action="store_true", help="discard previous work and start from scratch")
     p.add_argument("--allow-overlap", action="store_true", help="allow scope overlapping another running task")

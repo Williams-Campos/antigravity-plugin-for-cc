@@ -27,7 +27,7 @@ IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NA
 VERIFY = "python3 -c \"import sys; sys.path.insert(0, 'src'); import calc; assert calc.add(2, 3) == 5\""
 
 
-def manual(tid, role="implement", risk="low", extra="", body=None):
+def brief(tid, role="implement", risk="low", extra="", body=None):
     head = f'id = "{tid}"\ntitle = "task {tid}"\nrole = "{role}"\nrisk = "{risk}"\n{extra}'
     if role == "implement" and "allowed" not in extra:
         head += 'allowed = ["src/**"]\nprotected = ["tests/**"]\n'
@@ -96,7 +96,7 @@ class Base(unittest.TestCase):
         return json.loads(Path(self.env["FAKE_AGY_PLAN"] + ".calls").read_text())
 
     def task(self, tid, **kw):
-        (self.repo / ".agy" / "tasks" / f"{tid}.md").write_text(manual(tid, **kw))
+        (self.repo / ".agy" / "tasks" / f"{tid}.md").write_text(brief(tid, **kw))
 
     def state(self, tid):
         return json.loads((self.repo / ".agy" / "runs" / tid / "state.json").read_text())
@@ -446,7 +446,7 @@ class Conversations(Base):
         st = self.delivered("T1")
         self.plan({"write": {"src/calc.py": BAD},  # it must not change anything: the executor restores it
                    "so": report(answers=[{"question": "why +?", "answer": "the spec says sum",
-                                          "evidence": "manual, acceptance criteria"}])})
+                                          "evidence": "brief, acceptance criteria"}])})
         out = self.cli("grill", "T1", "why +?")
         self.assertIn("# T1-q1 · answers · DONE", out)
         self.assertIn("  - Q: why +?\n    A: the spec says sum", out)
@@ -677,13 +677,13 @@ class Validation(Base):
 
     def test_section_names_ignore_case(self):
         self.task("V11", body="## GOAL\nx\n\n## acceptance CRITERIA\n- x\n")
-        self.assertIn("valid manual", self.cli("check", "V11"))
+        self.assertIn("valid brief", self.cli("check", "V11"))
 
     def test_manual_tolerates_bom_and_leading_blank_lines(self):
         self.task("V8")
         path = self.repo / ".agy" / "tasks" / "V8.md"
         path.write_text("﻿\n\n" + path.read_text())
-        self.assertIn("valid manual", self.cli("check", "V8"))
+        self.assertIn("valid brief", self.cli("check", "V8"))
 
     def test_config_rejects_unknown_keys_and_modes(self):
         self.task("V9")
@@ -758,7 +758,7 @@ class ShippedManuals(Base):
             text = example.read_text()
             tid = text.split('id = "')[1].split('"')[0]
             (self.repo / ".agy" / "tasks" / f"{tid}.md").write_text(text)
-            self.assertIn("valid manual", self.cli("check", tid), example.name)
+            self.assertIn("valid brief", self.cli("check", tid), example.name)
 
     def test_every_role_has_template_and_rules(self):
         for role in ("implement", "explore", "review"):
@@ -774,7 +774,7 @@ class ShippedManuals(Base):
             self.cli("new", tid, "--role", role, "--title", "t", "--target", "T-001")
             path = self.repo / ".agy" / "tasks" / f"{tid}.md"
             path.write_text(path.read_text().replace("«", "").replace("»", ""))
-            self.assertIn("valid manual", self.cli("check", tid), role)
+            self.assertIn("valid brief", self.cli("check", tid), role)
 
 
 class Launcher(unittest.TestCase):
