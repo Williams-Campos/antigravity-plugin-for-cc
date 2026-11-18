@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The project follows
 [semantic versioning](https://semver.org/); while it is below 1.0, minor versions may contain
 breaking changes.
 
+## 0.6.0 — 2026-11-18
+
+### Added
+- **Team skills** (`skills` config key): Claude Code skills that both agents follow. agy receives
+  the text of each one at the start of every session; the bundled skill tells Claude to load the
+  same skills before writing code, briefs or validations. Entries are skill names
+  (`~/.claude/skills/<name>/SKILL.md`) or file paths. `agy-task doctor` lists them, and a missing
+  skill stops the task before agy is called.
+- **User configuration** in `~/.agy-bridge/config.toml`: defaults for every project, overridden
+  by each project's `.agy/config.toml`.
+
 ## 0.5.1 — 2026-11-17
 
 ### Changed

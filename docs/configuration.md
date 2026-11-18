@@ -29,9 +29,40 @@ autofix = ["ruff format ."]
 | `timeout_min` | `30` | Limit per agy turn, in minutes |
 | `verify_timeout_min` | `15` | Limit per verification command, in minutes |
 | `worktree_root` | `~/.agy-bridge/worktrees` | Where task worktrees are created |
+| `skills` | `[]` | Team skills both agents follow (see [Team skills](#team-skills)) |
 
 Brief headers can override `model`, `verify`, `max_fixups`, `max_diff_lines` and `timeout_min`
 per task.
+
+## User configuration
+
+`~/.agy-bridge/config.toml` takes the same keys and sets defaults for every project. The order is:
+built-in defaults, then the user file, then the project's `.agy/config.toml`. A key set in the
+project replaces the user value entirely.
+
+## Team skills
+
+A team skill is a Claude Code skill that both agents follow, so code written by Claude and code
+written by agy obey the same rules.
+
+```toml
+# ~/.agy-bridge/config.toml
+skills = ["ponytail"]
+```
+
+- **Entries** are skill names, resolved to `~/.claude/skills/<name>/SKILL.md` (the same file
+  Claude loads), or paths to a skill file.
+- **agy** receives the text of every skill, without its front matter, at the start of each
+  session: implement, explore, review, grill and answers. Follow-up turns in the same
+  conversation (`fix`, `recommend`, `reply`) do not resend it. The brief and agy's rules take
+  precedence over a skill.
+- **Claude** is told by the bundled skill to run `agy-task doctor`, which lists the team skills,
+  and to load each one before writing code, briefs or validations.
+- **A missing skill stops the task** before agy is called, with the path that was expected.
+- **To opt a project out**, set `skills = []` in its `.agy/config.toml`.
+
+Install a skill for Claude by placing its folder in `~/.claude/skills/`, for example
+`~/.claude/skills/ponytail/SKILL.md`.
 
 ## Choosing models
 

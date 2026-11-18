@@ -22,6 +22,10 @@ You (Claude) are the senior engineer and the head of the work: you analyse, deci
 
 Once per project: `agy-task init`, fill `.agy/config.toml` (`verify`, `link`, `setup`, `autofix`), then `agy-task baseline` to prove verification passes in a clean worktree without spending quota.
 
+## Team skills
+
+Run `agy-task doctor` at the start of the work: every `team skill <name>` line is a skill the whole team follows (set with `skills` in `~/.agy-bridge/config.toml`, or per project in `.agy/config.toml`). Before you write code, a brief or a validation, load each one with the Skill tool and follow it in everything you do: your own code, the split, the briefs (keep the `Decisions` and `Agreements` consistent with it) and the review of agy's work. agy receives the same text automatically at the start of every session, so you do not need to paste it into briefs; judge agy's result against it as you would your own.
+
 ## Writing the brief
 
 The brief is everything agy knows about your intent. Write it as you would for a capable colleague who has never seen the project:
