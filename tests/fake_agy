@@ -7,6 +7,7 @@ Each step is an object with optional keys:
   so      {...}              structured report it returns
   denied  [...]              denied actions it declares
   sleep   seconds            wait before replying (to test cancellation and timeouts)
+  run     [shell commands]   commands "agy" runs in its cwd (e.g. git commit)
   status, rc, stderr, error  to simulate executor failures
 
 If there are more calls than steps, the last step repeats. Every call (arguments and cwd) is
@@ -15,6 +16,7 @@ logged to <plan>.calls; access is serialised so parallel calls are supported.
 import fcntl
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -40,6 +42,8 @@ for path, content in step.get("write", {}).items():
         f.write(content)
 for path in step.get("delete", []):
     os.remove(path)
+for cmd in step.get("run", []):
+    subprocess.run(cmd, shell=True, check=True)
 
 env = {"conversation_id": "conv-fake", "status": step.get("status", "SUCCESS"), "response": "",
        "usage": {"input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 0}}

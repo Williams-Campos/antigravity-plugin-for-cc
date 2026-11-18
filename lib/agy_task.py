@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""agy-task — supervised executor that runs Antigravity (agy) tasks on behalf of Claude Code.
+"""agy-task — runs Antigravity (agy) as Claude Code's teammate.
 
-Claude writes one manual per task (.agy/tasks/<id>.md). This executor launches agy in
-isolation (its own worktree, no terminal, no writes outside that folder), applies
-deterministic gates and leaves a short result for Claude to decide on.
+Claude is the senior engineer: it analyses the work, splits it, and writes a brief for each
+task (.agy/tasks/<id>.md). agy is the experienced junior: it carries the brief out in its own
+git worktree. In the default collaborative mode agy has its full toolset (terminal, search,
+tests); the executor audits what it delivered, runs the project's verification and leaves
+Claude a short result to decide on. The strict mode keeps agy without a terminal and reverts
+anything outside scope.
 
-Exit codes of run/fix:
+Besides run/fix, Claude and agy talk through recommend (a non-binding suggestion), grill (an
+interrogation, in either direction) and reply (continuing a conversation).
+
+Exit codes of run, fix, recommend, grill and reply:
   0 ready (review or done) · 1 usage error or invalid manual · 2 blocked (agy has questions)
   3 gates failed           · 4 executor failure             · 10 quota · 11 authentication
   12 timeout
@@ -32,33 +38,42 @@ try:
 except ImportError:  # Python < 3.11
     sys.exit("agy-task: requires Python 3.11 or newer (tomllib).")
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 BRIDGE = Path(os.path.realpath(__file__)).parent.parent
 AGY = os.environ.get("AGY_BIN", "agy")
 HOME = Path(os.environ.get("AGY_BRIDGE_HOME", str(Path.home() / ".agy-bridge")))
 
-ROLES = ("implement", "explore", "review")
+MODES = ("collaborative", "strict")
+ROLES = ("implement", "explore", "review")  # roles a manual can have
+CONSULT_ROLES = ("grill", "answers")  # sessions started by grill, with no manual
+ALL_ROLES = ROLES + CONSULT_ROLES
 RISKS = ("low", "medium", "high")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$")
 PLACEHOLDER = "«"  # template marker: a manual that still contains it is not finished
 PROMPT_LIMIT = 60_000  # bytes; agy accepts up to ~64 KB through -p
 IMPLICIT_FORBIDDEN = [".agy/**", ".git/**"]
 PROBE_MODEL = "gemini-4-hydrogen-low"
-# Files that add nothing to the path map agy receives.
+# Build artifacts never belong to a task's diff (agy may run tests and leave them behind).
+ARTIFACT_GLOBS = ["**/__pycache__/**", "**/*.pyc", "**/.pytest_cache/**", "**/.mypy_cache/**",
+                  "**/.ruff_cache/**", "**/.DS_Store", "**/node_modules/**"]
+# Files that add nothing to the path map agy receives in strict mode.
 OPAQUE_EXT = {"jpg", "jpeg", "png", "gif", "webp", "ico", "icns", "bmp", "tiff", "mp4", "mov", "avi", "webm",
               "mp3", "wav", "ogg", "pdf", "zip", "gz", "tar", "7z", "jar", "ttf", "otf", "woff", "woff2",
               "keystore", "jks", "p12", "bin", "so", "dylib", "dll", "exe", "class", "pyc"}
 OPAQUE_NAMES = {".gitkeep", ".DS_Store"}
 
 DEFAULTS = {
-    "model_implement": "gemini-4-hydrogen-high",
+    "mode": "collaborative",
+    "model_implement": "gemini-4-argon-high",
     "model_explore": "gemini-4-hydrogen-high",
-    "model_review": "gemini-4-argon-high",
+    "model_review": "gemini-4-hydrogen-high",
+    "model_grill": "gemini-4-argon-high",
     "verify": [],
     "link": [],
     "setup": [],
     "autofix": [],
+    "artifacts": [],
     "max_fixups": 2,
     "max_diff_lines": 800,
     "timeout_min": 30,
@@ -81,19 +96,41 @@ def _report_schema(extra, required):
     return {"type": "object", "properties": props, "required": ["status", "summary", "questions", *required]}
 
 
+def _items(props, required):
+    return {"type": "array", "items": {"type": "object", "properties": props, "required": required}}
+
+
 def _located(extra, required):
     props = {"path": {"type": "string"}, "line": {"type": "integer"}, "note": {"type": "string"}, **extra}
-    return {"type": "array", "items": {"type": "object", "properties": props, "required": ["path", "note", *required]}}
+    return _items(props, ["path", "note", *required])
 
 
 _STRINGS = {"type": "array", "items": {"type": "string"}}
+_STR = {"type": "string"}
+_SEVERITY = {"type": "string", "enum": ["high", "medium", "low"]}
+_REC = {"recommendations": _STRINGS}
 SCHEMAS = {
-    "implement": _report_schema({"files_changed": _STRINGS, "decisions": _STRINGS}, ["files_changed", "decisions"]),
-    "explore": _report_schema({"findings": _located({}, [])}, ["findings"]),
+    "implement": _report_schema(
+        {"files_changed": _STRINGS, "decisions": _STRINGS, **_REC,
+         "suggestion": {"type": "object", "required": ["decision", "reason"],
+                        "properties": {"decision": {"type": "string", "enum": ["adopted", "declined"]},
+                                       "reason": _STR}}},
+        ["files_changed", "decisions", "recommendations"]),
+    "explore": _report_schema({"findings": _located({}, []), **_REC}, ["findings", "recommendations"]),
     "review": _report_schema(
         {"verdict": {"type": "string", "enum": ["approve", "request_changes"]},
-         "issues": _located({"severity": {"type": "string", "enum": ["high", "medium", "low"]}}, ["severity"])},
-        ["verdict", "issues"]),
+         "issues": _located({"severity": _SEVERITY}, ["severity"]), **_REC},
+        ["verdict", "issues", "recommendations"]),
+    "grill": _report_schema(
+        {"verdict": {"type": "string", "enum": ["sound", "concerns", "unsound"]},
+         "objections": _items({"severity": _SEVERITY, "claim": _STR, "challenge": _STR, "evidence": _STR,
+                               "path": _STR, "line": {"type": "integer"}},
+                              ["severity", "claim", "challenge", "evidence"]), **_REC},
+        ["verdict", "objections", "recommendations"]),
+    "answers": _report_schema(
+        {"answers": _items({"question": _STR, "answer": _STR, "evidence": _STR}, ["question", "answer", "evidence"]),
+         **_REC},
+        ["answers", "recommendations"]),
 }
 
 
@@ -297,6 +334,8 @@ def load_config(repo):
         if unknown:
             die(f".agy/config.toml: unknown keys: {', '.join(sorted(unknown))}")
         cfg.update(data)
+    if cfg["mode"] not in MODES:
+        die(f".agy/config.toml: mode must be one of {MODES}")
     return cfg
 
 
@@ -379,10 +418,10 @@ def validate(repo, t, tid):
             errs.append("risk = high is not delegated as an implementation: do it yourself (Claude) "
                         "or split the task and delegate only the low/medium-risk part")
         if not t.get("allowed"):
-            errs.append("implement requires 'allowed' (the files agy may touch)")
+            errs.append("implement requires 'allowed' (the agreed area: files agy is expected to touch)")
         if not t.get("verify"):
             errs.append("implement requires 'verify' (in the manual or in .agy/config.toml): "
-                        "without automatic verification there is no supervision")
+                        "without verification Claude cannot accept on a summary")
         if not section(body, "Acceptance criteria"):
             errs.append("missing the '## Acceptance criteria' section")
     if role == "review":
@@ -437,6 +476,17 @@ def running_tasks(repo, exclude):
     return [s for s in states if s.get("id") != exclude and is_running(s)]
 
 
+def next_id(repo, prefix, pad=3):
+    """Next free run id with this prefix (G-001, G-002… or T-1-q1, T-1-q2…)."""
+    taken = [p.name[len(prefix):] for p in runs_dir(repo).glob(f"{glob_escape(prefix)}*")]
+    n = 1 + max((int(x) for x in taken if x.isdigit()), default=0)
+    return f"{prefix}{n:0{pad}d}"
+
+
+def glob_escape(text):
+    return re.sub(r"([*?\[])", r"[\1]", text)
+
+
 def worktree_path(repo, cfg, tid):
     root = Path(cfg["worktree_root"]).expanduser() if cfg["worktree_root"] else HOME / "worktrees"
     tag = hashlib.sha1(str(repo).encode()).hexdigest()[:8]
@@ -481,12 +531,12 @@ def baseline_ok(repo):
 # ───────────────────────── calling agy ─────────────────────────
 
 def settings_for(role):
-    """Permissions for the agy session (--settings: they do not touch agy's global configuration).
+    """Strict-mode permissions for the agy session (--settings: they do not touch agy's global configuration).
 
     The terminal is never granted: in agy a command(<prefix>) rule also accepts redirections,
     chaining and subshells (measured on 1.5.8), so allowing a single command is the same as
-    allowing them all. That is why agy receives a file map and pre-run searches, and this
-    program runs the formatter itself.
+    allowing them all. That is why strict mode gives agy a file map and pre-run searches, and
+    this program runs the formatter itself.
 
     toolPermission is always set so a more permissive mode is never inherited from the global
     configuration. Read-only sessions also need agentMode="": without it, agy's default Auto
@@ -497,6 +547,14 @@ def settings_for(role):
                 "permissions": {"allow": []}}
     return {"allowNonWorkspaceAccess": False, "agentMode": "", "toolPermission": "request-review",
             "permissions": {"allow": [], "ask": ["write_file(*)", "command(*)"]}}
+
+
+def agy_perms(mode, role):
+    """agy permission flags. Collaborative: the full toolset, as if the user ran agy themselves."""
+    if mode == "collaborative":
+        return ["--dangerously-skip-permissions"]
+    args = ["--settings", json.dumps(settings_for(role))]
+    return args + (["--mode", "accept-edits"] if role == "implement" else [])
 
 
 def _parse_envelope(raw):
@@ -524,17 +582,14 @@ def _failure_kind(env, stderr):
     return "error"
 
 
-def call_agy(cwd, prompt, model, role, schema, timeout_s, out_base, conversation=None):
+def call_agy(cwd, prompt, model, perms, schema, timeout_s, out_base, conversation=None):
     """One headless agy turn. Returns {kind, env, secs, detail}; kind ∈ ok, missing, timeout,
     quota, auth, model, error. The raw output is kept in <out_base>.json and .err."""
     if len(prompt.encode()) > PROMPT_LIMIT:
         return {"kind": "error", "env": {}, "secs": 0,
                 "detail": "the prompt exceeds 60 KB: shorten the manual or split the task"}
-    cmd = [AGY, "--model", model, "--settings", json.dumps(settings_for(role)),
-           "--output-format", "json", "--json-schema", json.dumps(schema),
+    cmd = [AGY, "--model", model, *perms, "--output-format", "json", "--json-schema", json.dumps(schema),
            "--print-timeout", f"{int(timeout_s)}s", "--disable-slash-commands"]
-    if role == "implement":
-        cmd += ["--mode", "accept-edits"]
     if conversation:
         cmd += ["--conversation", conversation]
     cmd += ["-p", prompt]  # -p takes the prompt as its value: always last
@@ -577,10 +632,10 @@ def valid_report(env):
     return report if isinstance(report, dict) and report.get("status") in ("done", "blocked") else None
 
 
-# ───────────────────────── containment ─────────────────────────
-# All supervision rests on agy honouring the session permissions. agy updates itself and that
+# ───────────────────────── containment (strict mode) ─────────────────────────
+# Strict mode rests on agy honouring the session permissions. agy updates itself and that
 # behaviour has changed between versions, so it is checked live once per version before
-# anything is delegated.
+# anything is delegated in strict mode.
 
 def agy_version():
     try:
@@ -621,7 +676,7 @@ def _probe_specs():
 
 
 def probe_containment(models):
-    """Probes agy's permissions live. Returns [(ok, label)]; each probe uses its own folder."""
+    """Probes agy's strict-mode permissions live. Returns [(ok, label)]; each probe uses its own folder."""
     HOME.mkdir(parents=True, exist_ok=True)
     base = Path(tempfile.mkdtemp(prefix="probe-", dir=HOME))
     schema = {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]}
@@ -636,7 +691,8 @@ def probe_containment(models):
         (outside / "lib.txt").write_text("original\n")
         (ws / "dep").symlink_to(outside, target_is_directory=True)
         for model in models:  # the probe model may not exist on the user's plan
-            r = call_agy(ws, prompt.format(outside=outside), model, role, schema, 120, base / name / "out")
+            r = call_agy(ws, prompt.format(outside=outside), model, agy_perms("strict", role), schema, 120,
+                         base / name / "out")
             if r["kind"] != "model":
                 break
         if r["kind"] != "ok":
@@ -658,7 +714,9 @@ def record_containment(version, results):
 
 
 def ensure_containment(cfg):
-    """Before delegating: the installed agy version must have verified containment."""
+    """Strict mode only: the installed agy version must have verified containment."""
+    if cfg["mode"] != "strict":
+        return
     version = agy_version()
     if not version:
         die(f"could not run '{AGY} --version': is agy installed and on the PATH?", EXIT_EXECUTOR)
@@ -669,16 +727,19 @@ def ensure_containment(cfg):
           file=sys.stderr)
     results = probe_containment([PROBE_MODEL, cfg["model_implement"]])
     if not record_containment(version, results):
-        die(f"containment check failed for agy {version}; nothing will be delegated until it is resolved:\n  - "
-            + "\n  - ".join(label for good, label in results if not good)
+        die(f"containment check failed for agy {version}; nothing will be delegated in strict mode until it "
+            "is resolved:\n  - " + "\n  - ".join(label for good, label in results if not good)
             + "\nRun `agy-task doctor --probe` again and check whether agy changed its permission model.",
             EXIT_EXECUTOR)
 
 
 # ───────────────────────── prompts ─────────────────────────
 
-def rules(role):
-    return (BRIDGE / "rules" / f"{role}.md").read_text().strip()
+def rules(mode, role):
+    path = BRIDGE / "rules" / mode / f"{role}.md"
+    if not path.exists():
+        path = BRIDGE / "rules" / "collaborative" / f"{role}.md"
+    return path.read_text().strip()
 
 
 def bullets(items):
@@ -689,11 +750,16 @@ def join_parts(parts):
     return "\n\n".join(p for p in parts if p)
 
 
+def hints_block(terms):
+    """Collaborative mode: search terms become starting points, since agy can search on its own."""
+    return f"Useful starting points — exact text worth searching for:\n{bullets(terms)}" if terms else ""
+
+
 def search_block(cwd, terms):
-    """Exact-text searches run by the executor: agy has no search tool."""
+    """Strict mode: exact-text searches run by the executor, because agy has no search tool."""
     if not terms:
         return ""
-    out = ["## Searches run by the supervisor (exact text across the whole project; you have no search tool)"]
+    out = ["## Searches run by the senior (exact text across the whole project; you have no search tool)"]
     for term in terms:
         lines = git_try(cwd, "grep", "-n", "-I", "-F", "--untracked", "-e", term, "--", ".",
                         ":(exclude).agy").stdout.splitlines()
@@ -716,7 +782,7 @@ def _fit(lines, budget, overflow):
 
 
 def file_map(cwd, focus, budget=30000):
-    """Path map for the prompt: agy has no directory listing or search."""
+    """Strict mode: path map for the prompt, because agy has no directory listing or search."""
     listed = [f for f in git(cwd, "ls-files", "-co", "--exclude-standard").splitlines()
               if f and not f.startswith(".agy/")]
     files = [f for f in listed if f.rsplit("/", 1)[-1] not in OPAQUE_NAMES
@@ -740,38 +806,60 @@ def file_map(cwd, focus, budget=30000):
             + "\n".join(summary))
 
 
-def implement_prompt(t, wt):
-    seeds = ("Files provided by the supervisor (already in your workspace; they are part of the contract, "
+def implement_prompt(t, wt, mode, links=()):
+    seeds = ("Files provided by the senior (already in your workspace; they are part of the contract, "
              f"do not modify them):\n{bullets(t['seed'])}") if t["seed"] else ""
+    if mode == "strict":
+        return join_parts([
+            rules(mode, "implement"),
+            f"## Contract for task {t['id']} — {t['title']}",
+            f"Allowed files (you may only create or modify these):\n{bullets(t['allowed'])}",
+            f"Forbidden files:\n{bullets(t['forbidden'] + IMPLICIT_FORBIDDEN)}",
+            f"Protected files (do not modify them; they define what is correct):\n{bullets(t['protected'])}",
+            seeds,
+            f"You have no terminal. The senior will run these checks when you finish:\n{bullets(t['verify'])}",
+            f"Approximate maximum size of the change: {t['max_diff_lines']} lines.",
+            "## Manual",
+            t["_body"],
+            search_block(wt, t["search"]),
+            file_map(wt, t["allowed"]),
+        ])
+    shared = ("Paths shared with the main project through symlinks (do not install into, modify or delete "
+              f"them):\n{bullets(links)}") if links else ""
     return join_parts([
-        rules("implement"),
-        f"## Contract for task {t['id']} — {t['title']}",
-        f"Allowed files (you may only create or modify these):\n{bullets(t['allowed'])}",
-        f"Forbidden files:\n{bullets(t['forbidden'] + IMPLICIT_FORBIDDEN)}",
-        f"Protected files (do not modify them; they define what is correct):\n{bullets(t['protected'])}",
+        rules(mode, "implement"),
+        f"## Brief for task {t['id']} — {t['title']}",
+        f"Agreed area — the files this task is expected to create or modify:\n{bullets(t['allowed'])}",
+        f"Do not modify (they define what is correct):\n{bullets(t['protected'])}",
+        f"Off limits:\n{bullets(t['forbidden'] + IMPLICIT_FORBIDDEN)}",
         seeds,
-        f"You have no terminal. The supervisor will run these checks when you finish:\n{bullets(t['verify'])}",
+        shared,
+        "Verification the senior runs when you deliver (run it yourself first, from the repository root):\n"
+        + bullets(t["verify"]),
         f"Approximate maximum size of the change: {t['max_diff_lines']} lines.",
-        "## Manual",
+        hints_block(t["search"]),
+        "## Brief",
         t["_body"],
-        search_block(wt, t["search"]),
-        file_map(wt, t["allowed"]),
     ])
 
 
-def explore_prompt(t, cwd):
+def explore_prompt(t, cwd, mode):
     focus = f"Areas of interest:\n{bullets(t['allowed'])}\n\n" if t["allowed"] else ""
-    return join_parts([rules("explore"), f"## Assignment {t['id']} — {t['title']}", focus + t["_body"],
-                       search_block(cwd, t["search"]), file_map(cwd, t["allowed"])])
+    head = [rules(mode, "explore"), f"## Assignment {t['id']} — {t['title']}", focus + t["_body"]]
+    if mode == "strict":
+        return join_parts(head + [search_block(cwd, t["search"]), file_map(cwd, t["allowed"])])
+    return join_parts(head + [hints_block(t["search"])])
 
 
-def review_prompt(t, diff, cwd):
-    return join_parts([rules("review"), f"## Review {t['id']} — {t['title']}", t["_body"],
-                       "## Diff to review", "```diff\n" + diff + "\n```",
-                       search_block(cwd, t["search"]), file_map(cwd, [], budget=6000)])
+def review_prompt(t, diff, cwd, mode):
+    head = [rules(mode, "review"), f"## Review {t['id']} — {t['title']}", t["_body"],
+            "## Diff to review", "```diff\n" + diff + "\n```"]
+    if mode == "strict":
+        return join_parts(head + [search_block(cwd, t["search"]), file_map(cwd, [], budget=6000)])
+    return join_parts(head + [hints_block(t["search"])])
 
 
-# ───────────────────────── gates ─────────────────────────
+# ───────────────────────── gates and audit ─────────────────────────
 
 def copy_seeds(repo, wt, rd, seeds):
     """Brings project files that are not committed yet (tests written by Claude) into the worktree.
@@ -792,9 +880,10 @@ def restore_seeds(wt, rd, seeds, attempt):
     return incidents
 
 
-def stage(wt, outside):
-    """Stages everything except `outside` (linked dependencies and supervisor files)."""
-    git(wt, "add", "-A", "--", ".", *[f":(exclude){path}" for path in outside])
+def stage(wt, outside, artifacts):
+    """Stages everything except `outside` (linked dependencies, senior's files) and build artifacts."""
+    git(wt, "add", "-A", "--", ".", *[f":(exclude){path}" for path in outside],
+        *[f":(exclude,glob){pat}" for pat in artifacts])
 
 
 def changed(wt, base):
@@ -823,10 +912,10 @@ def restore(wt, base, status, path):
         git(wt, "checkout", "-q", base, "--", path)
 
 
-def enforce_scope(wt, base, t, outside, attempt):
-    """Reverts every change outside the contract and returns (in-scope changes, incidents).
+def enforce_scope(wt, base, t, outside, artifacts, attempt):
+    """Strict mode: reverts every change outside the contract and returns (in-scope changes, incidents).
     Whatever remains in the index is guaranteed to be inside `allowed` and outside `protected`."""
-    stage(wt, outside)
+    stage(wt, outside, artifacts)
     forbidden = t["forbidden"] + IMPLICIT_FORBIDDEN
     incidents = []
     for status, path in changed(wt, base):
@@ -841,8 +930,45 @@ def enforce_scope(wt, base, t, outside, attempt):
         restore(wt, base, status, path)
         incidents.append({"attempt": attempt, "kind": kind, "path": path})
     if incidents:
-        stage(wt, outside)
+        stage(wt, outside, artifacts)
     return changed(wt, base), incidents
+
+
+def audit_scope(wt, base, t, outside, artifacts, attempt):
+    """Collaborative mode: records what falls outside the agreement without undoing it, so Claude
+    can judge it. Only the executor's own territory (.agy/, .git/) is restored.
+    Returns (changes, audit notes describing the current diff)."""
+    stage(wt, outside, artifacts)
+    notes, restored = [], False
+    for status, path in changed(wt, base):
+        if matches(path, IMPLICIT_FORBIDDEN):
+            restore(wt, base, status, path)
+            restored, kind = True, "executor_area_restored"
+        elif matches(path, t["protected"]):
+            kind = "protected_modified"
+        elif matches(path, t["forbidden"]):
+            kind = "off_limits_modified"
+        elif not matches(path, t["allowed"]):
+            kind = "outside_agreed_area"
+        else:
+            continue
+        notes.append({"attempt": attempt, "kind": kind, "path": path})
+    if restored:
+        stage(wt, outside, artifacts)
+    return changed(wt, base), notes
+
+
+def git_coexistence(wt, expected_head, branch, attempt):
+    """Collaborative mode: agy must leave git to the senior. Commits it made are folded back into
+    the index; leaving the task branch is reported as a failure. Returns (notes, ok)."""
+    ref = git_try(wt, "symbolic-ref", "-q", "HEAD").stdout.strip()
+    if ref != f"refs/heads/{branch}":
+        return [{"attempt": attempt, "kind": "branch_changed", "path": ref or "detached HEAD"}], False
+    head = git(wt, "rev-parse", "HEAD").strip()
+    if head == expected_head:
+        return [], True
+    git(wt, "reset", "-q", "--soft", expected_head)
+    return [{"attempt": attempt, "kind": "agy_committed", "path": "its commits were folded back into the index"}], True
 
 
 def commit(wt, t):
@@ -856,11 +982,19 @@ def commit(wt, t):
         "-m", f"agy({t['id']}): {t['title']}")
 
 
-def tree_fingerprint(cwd):
-    """Fingerprint of the working tree, to detect writes during a read-only assignment."""
-    status = git(cwd, "status", "--porcelain=v1", "-z", "--", ".", ":(exclude).agy")
+def tree_fingerprint(cwd, untracked=True):
+    """Fingerprint of the working tree, to detect writes during a read-only session. Collaborative
+    sessions ignore untracked files, because running tests legitimately leaves artifacts behind."""
+    status = git(cwd, "status", "--porcelain=v1", "-z", f"--untracked-files={'all' if untracked else 'no'}",
+                 "--", ".", ":(exclude).agy")
     diff = git_try(cwd, "diff", "HEAD", "--", ".", ":(exclude).agy").stdout
     return status + hashlib.sha1(diff.encode()).hexdigest()
+
+
+def restore_worktree(wt, outside):
+    """Puts a task worktree back on its verified commit (keeping links and the senior's files)."""
+    git_try(wt, "reset", "-q", "--hard", "HEAD")
+    git_try(wt, "clean", "-fdq", *[arg for path in outside for arg in ("-e", path)])
 
 
 # ───────────────────────── supervision ─────────────────────────
@@ -868,33 +1002,49 @@ def tree_fingerprint(cwd):
 def supervise(repo, t, cfg, st, message, conversation=None):
     """Loop of agy turn → gates → fix-up. Leaves the final state in st."""
     wt, base, rd = Path(st["worktree"]), st["base"], run_dir(repo, t["id"])
+    mode = st["mode"]
+    free = mode == "collaborative"
     outside = st.get("links", []) + st.get("seeds", [])  # worktree paths that never enter the diff
+    artifacts = ARTIFACT_GLOBS + cfg["artifacts"]
     limit = cfg["verify_timeout_min"] * 60
     reason = "gates"
     for _ in range(1 + t["max_fixups"]):
         n = st["attempts"] = st.get("attempts", 0) + 1
         save_state(repo, st)
-        result = call_agy(wt, message, t["model"], "implement", SCHEMAS["implement"], t["timeout_min"] * 60,
-                          rd / f"attempt-{n}", conversation)
+        head = git(wt, "rev-parse", "HEAD").strip()
+        result = call_agy(wt, message, t["model"], agy_perms(mode, "implement"), SCHEMAS["implement"],
+                          t["timeout_min"] * 60, rd / f"attempt-{n}", conversation)
         add_usage(st, result)
         if result["kind"] != "ok":
             st.update(state="failed", reason=result["kind"], detail=result["detail"])
             return
         env = result["env"]
         conversation = st["conversation_id"] = env.get("conversation_id") or conversation
+        if free:
+            notes, on_branch = git_coexistence(wt, head, st["branch"], n)
+            st["incidents"] += notes
+            if not on_branch:
+                st.update(state="failed", reason="git",
+                          detail="agy left the task branch; inspect the worktree before anything else")
+                return
 
         gates = {}
-        if cfg["autofix"]:  # formatters: agy has no terminal to run them
+        if cfg["autofix"]:  # formatters: normalise the code before verification
             fixed = run_commands(wt, cfg["autofix"], limit, rd / f"autofix-{n}.log", t["id"])
             if not fixed["ok"]:
                 gates["autofix"] = {"ok": False, "warning": True,
                                     "detail": f"`{fixed['command']}` failed (rc={fixed['rc']})"}
         incidents = restore_seeds(wt, rd, st.get("seeds", []), n)
-        files, out_of_scope = enforce_scope(wt, base, t, outside, n)
-        incidents += out_of_scope
+        if free:
+            files, st["scope_notes"] = audit_scope(wt, base, t, outside, artifacts, n)
+            notice = (" Note: these files belong to the senior's contract and were restored: "
+                      + ", ".join(i["path"] for i in incidents) + ".") if incidents else ""
+        else:
+            files, out_of_scope = enforce_scope(wt, base, t, outside, artifacts, n)
+            incidents += out_of_scope
+            notice = (" In addition, these changes were reverted because they are outside your scope: "
+                      + ", ".join(f"{i['path']} ({i['kind']})" for i in incidents) + ".") if incidents else ""
         st["incidents"] += incidents
-        reverted = (" In addition, these changes were reverted because they are outside your scope: "
-                    + ", ".join(f"{i['path']} ({i['kind']})" for i in incidents) + ".") if incidents else ""
 
         denied, report = denied_names(env), valid_report(env)
         if denied:
@@ -902,12 +1052,12 @@ def supervise(repo, t, cfg, st, message, conversation=None):
             message = (f"Your previous turn was cancelled because you attempted an action that is not allowed "
                        f"({denied}). You have no terminal and no access outside the workspace. Check the current "
                        "state of the files, complete whatever is missing without that action, and deliver the "
-                       "structured report." + reverted)
+                       "structured report." + notice)
             continue
         if not report:
             reason, st["gates"] = "no_report", {"turn": {"ok": False, "detail": "no structured report"}}
             message = ("You did not deliver the structured report. Make sure the task is complete and "
-                       "reply with the report only." + reverted)
+                       "reply with the report only." + notice)
             continue
         st["report"] = report
         if report["status"] == "blocked":
@@ -918,8 +1068,8 @@ def supervise(repo, t, cfg, st, message, conversation=None):
         gates["changes"] = {"ok": bool(files), "detail": f"{len(files)} file(s)"}
         st["gates"] = gates
         if not files:
-            message = ("You reported 'done' but no change remained inside the allowed files." + reverted
-                       + " Implement the task within scope, or reply 'blocked' explaining what you need.")
+            message = ("You reported 'done' but no change remained in the task's diff." + notice
+                       + " Implement the task, or reply 'blocked' explaining what you need.")
             continue
         total = numstat(wt, base)[1]
         gates["size"] = {"ok": total <= t["max_diff_lines"], "warning": True,
@@ -935,18 +1085,69 @@ def supervise(repo, t, cfg, st, message, conversation=None):
             return
         gates["verify"] = {"ok": False, "detail": f"`{verified['command']}` failed (rc={verified['rc']})"}
         st["verify_tail"] = tail(verified["tail"], 1500)
-        message = ("The supervisor's verification failed.\n"
+        message = ("The senior's verification failed.\n"
                    f"Command: {verified['command']}\nOutput (tail):\n```\n{verified['tail']}\n```\n"
-                   "Fix the implementation within the allowed files. Do not modify protected files. "
-                   "Deliver the structured report again." + reverted)
+                   "Fix the implementation. Do not modify the files that define what is correct. "
+                   "Deliver the structured report again." + notice)
     st.update(state="failed", reason=reason, detail="ran out of fix-up attempts")
 
 
+def consult(repo, cfg, t, message, cwd, conversation=None, prev=None):
+    """A session that must not change the project: explore, review, grill, answers and their replies.
+    `t["guard"]` names a task whose verified worktree is restored if the session changed it."""
+    mode = prev.get("mode", cfg["mode"]) if prev else cfg["mode"]
+    free = mode == "collaborative"
+    ensure_containment(dict(cfg, mode=mode))
+    tid = t["id"]
+    if prev is None:
+        shutil.rmtree(run_dir(repo, tid), ignore_errors=True)
+    st = begin(repo, t, {"mode": mode, "cwd": str(cwd), "guard": t.get("guard", ""), "target": t.get("target", "")})
+    if prev:
+        usage = prev.get("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0})
+        st.update(started=prev.get("started", st["started"]), active_secs=prev.get("active_secs", 0),
+                  attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
+                  usage=usage, usage_before=dict(usage))
+    rd = run_dir(repo, tid)
+    (rd / ("prompt.txt" if prev is None else f"reply-{st['attempts'] + 1}.txt")).write_text(message)
+    before = tree_fingerprint(cwd, untracked=not free)
+    st.update(state="failed", reason="no_report", detail="agy did not deliver a valid report")
+    for _ in range(1 + t["max_fixups"]):
+        n = st["attempts"] = st["attempts"] + 1
+        result = call_agy(cwd, message, t["model"], agy_perms(mode, t["role"]), SCHEMAS[t["role"]],
+                          t["timeout_min"] * 60, rd / f"attempt-{n}", conversation)
+        add_usage(st, result)
+        if result["kind"] != "ok":
+            st.update(state="failed", reason=result["kind"], detail=result["detail"])
+            break
+        env = result["env"]
+        conversation = st["conversation_id"] = env.get("conversation_id") or conversation
+        report = valid_report(env)
+        if denied_names(env):
+            st["detail"] = "agy attempted a write or terminal action (denied)"
+            message = ("Your turn was cancelled because you tried to modify files or run commands. This session "
+                       "is read-only: use only your file-reading tool and deliver the structured report.")
+        elif report:
+            st["report"] = report
+            st.update(state=report["status"], reason="questions" if report["status"] == "blocked" else "", detail="")
+            break
+        else:
+            message = "You did not deliver the structured report. Reply with the report only."
+    if tree_fingerprint(cwd, untracked=not free) != before:  # nothing may change during a consultation
+        note = {"attempt": st["attempts"], "kind": "tree_modified_during_read_only",
+                "path": f"{cwd} (check `git status`; it may be agy or another edit made in parallel)"}
+        guard = load_state(repo, t["guard"]) if t.get("guard") else {}
+        if guard.get("state") == "review":
+            restore_worktree(cwd, guard.get("links", []) + guard.get("seeds", []))
+            note["path"] = f"{cwd} (restored to the verified commit of {t['guard']})"
+        st["incidents"].append(note)
+    finish(repo, t, st)
+
+
 def run_readonly(repo, cfg, t):
-    """explore and review assignments: a single read-only agent, without a worktree of its own."""
-    tid, cwd = t["id"], repo
+    """explore and review assignments: one session that must not change the project."""
+    mode, cwd = cfg["mode"], repo
     if t["role"] == "explore":
-        prompt = explore_prompt(t, repo)
+        prompt = explore_prompt(t, repo, mode)
     else:
         if t["target"] == "working":
             diff = git(repo, "diff", "HEAD")
@@ -956,50 +1157,19 @@ def run_readonly(repo, cfg, t):
                 die(f"target task {t['target']} has no active worktree to review.")
             cwd = Path(target["worktree"])
             diff = git(cwd, "diff", "--cached", target["base"])
+            t = dict(t, guard=t["target"])
         if not diff.strip():
             die("there are no changes to review.")
-        prompt = review_prompt(t, diff, cwd)
+        prompt = review_prompt(t, diff, cwd, mode)
         if len(prompt.encode()) > PROMPT_LIMIT:
             die("the diff is too large for a single review (>60 KB): split the task.")
-    ensure_containment(cfg)
-    shutil.rmtree(run_dir(repo, tid), ignore_errors=True)
-    st = begin(repo, t, {})
-    rd = run_dir(repo, tid)
-    (rd / "prompt.txt").write_text(prompt)
-    before = tree_fingerprint(cwd)
-    message, conversation = prompt, None
-    st.update(state="failed", reason="no_report", detail="agy did not deliver a valid report")
-    for _ in range(1 + t["max_fixups"]):
-        n = st["attempts"] = st["attempts"] + 1
-        result = call_agy(cwd, message, t["model"], t["role"], SCHEMAS[t["role"]], t["timeout_min"] * 60,
-                          rd / f"attempt-{n}", conversation)
-        add_usage(st, result)
-        if result["kind"] != "ok":
-            st.update(state="failed", reason=result["kind"], detail=result["detail"])
-            break
-        env = result["env"]
-        conversation = env.get("conversation_id") or conversation
-        report = valid_report(env)
-        if denied_names(env):
-            st["detail"] = "agy attempted a write or terminal action (denied)"
-            message = ("Your turn was cancelled because you tried to modify files or run commands. This assignment "
-                       "is read-only: use only your file-reading tool and deliver the structured report.")
-        elif report:
-            st["report"] = report
-            st.update(state=report["status"], reason="questions" if report["status"] == "blocked" else "", detail="")
-            break
-        else:
-            message = "You did not deliver the structured report. Reply with the report only."
-    if tree_fingerprint(cwd) != before:  # second barrier, in case agy's permissions change
-        st["incidents"].append({"attempt": st["attempts"], "kind": "tree_modified_during_read_only",
-                                "path": f"{cwd} (check `git status`; it may be agy or another edit made in parallel)"})
-    finish(repo, t, st)
+    consult(repo, cfg, t, prompt, cwd)
 
 
 # ───────────────────────── lifecycle and result ─────────────────────────
 
 def begin(repo, t, extra):
-    """Opens a work session (run or fix) and sets the state to `running`."""
+    """Opens a work session and sets the state to `running`."""
     now = time.time()
     st = {"id": t["id"], "role": t["role"], "state": "running", "reason": "", "detail": "",
           "title": t["title"], "risk": t["risk"], "model": t["model"], "pid": os.getpid(),
@@ -1018,12 +1188,16 @@ def begin(repo, t, extra):
     return st
 
 
+def all_notes(st):
+    return st.get("incidents", []) + st.get("scope_notes", [])
+
+
 def review_level(t, st):
     """How much Claude must read before accepting: `summary` only when nothing argues against it."""
     if t["role"] != "implement":
         return "none"
     oversize = not st.get("gates", {}).get("size", {}).get("ok", True)
-    clean = t["risk"] == "low" and not st.get("incidents") and not oversize
+    clean = t["risk"] == "low" and not all_notes(st) and not oversize
     return "summary" if clean else "diff"
 
 
@@ -1031,7 +1205,7 @@ def finish(repo, t, st):
     """Closes the session: saves the state, writes the result, logs metrics and exits."""
     st["finished"] = time.time()
     session_secs = round(st["finished"] - st["session_started"], 1)
-    st["active_secs"] = round(st.get("active_secs", 0) + session_secs, 1)  # run + each fix, without idle time
+    st["active_secs"] = round(st.get("active_secs", 0) + session_secs, 1)  # run + each follow-up, without idle time
     st["pid"] = None
     st["review_level"] = review_level(t, st)
     wt = Path(st.get("worktree", "/nonexistent"))
@@ -1046,33 +1220,45 @@ def finish(repo, t, st):
     session_usage = {k: round(v - before.get(k, 0), 1) for k, v in st.get("usage", {}).items()}
     with open(runs_dir(repo) / "usage.jsonl", "a") as log:
         log.write(json.dumps({"ts": int(st["finished"]), "id": t["id"], "role": t["role"], "model": t["model"],
-                              "state": st["state"], "reason": st["reason"], "attempts": st["attempts"],
-                              "secs": session_secs, "incidents": len(st["incidents"]), **session_usage}) + "\n")
+                              "mode": st.get("mode", ""), "state": st["state"], "reason": st["reason"],
+                              "attempts": st["attempts"], "secs": session_secs,
+                              "incidents": len(all_notes(st)), **session_usage}) + "\n")
     sys.stdout.write(text)
     sys.exit(EXIT_BY_STATE.get(st["state"], EXIT_BY_REASON.get(st["reason"], EXIT_EXECUTOR)))
 
 
 def next_step(tid, st):
-    state = st["state"]
+    state, role, report = st["state"], st["role"], st.get("report") or {}
     if state == "review":
-        first = (f"low risk and no incidents → you may accept on the summary: agy-task accept {tid}"
+        first = (f"low risk and nothing to audit → you may accept on the summary: agy-task accept {tid}"
                  if st["review_level"] == "summary" else
                  f"read the diff before accepting: agy-task diff {tid} → agy-task accept {tid} --reviewed")
-        return first + f"\n  alternatives: agy-task fix {tid} \"<correction>\" · agy-task reject {tid}"
-    if state == "blocked" and st["role"] == "implement":
+        return (first + f"\n  also: agy-task fix {tid} \"<order>\" · recommend {tid} \"<suggestion>\" · "
+                f"grill {tid} \"<questions>\" · reject {tid}")
+    if state == "blocked" and role == "implement":
         return f"answer the questions: agy-task fix {tid} \"<answers>\"  (or fix the manual and run --restart)"
     if state == "blocked":
-        return f"clarify the assignment in the manual and run it again: agy-task run {tid}"
-    if state == "failed" and st["role"] == "implement":
+        return f"answer it: agy-task reply {tid} \"<answers>\"  (or clarify the manual and run it again)"
+    if state == "failed" and role == "implement":
         return (f"check .agy/runs/{tid}/ (verify-*.log, attempt-*.err); options: agy-task fix {tid} \"<hint>\""
                 f" · agy-task run {tid} --restart · do it yourself · agy-task reject {tid}")
     if state == "failed":
-        return f"check .agy/runs/{tid}/attempt-*.err and run it again: agy-task run {tid}"
+        return f"check .agy/runs/{tid}/attempt-*.err and try again"
+    if state == "done" and role == "grill":
+        if report.get("objections"):
+            return (f"answer the objections that do not hold: agy-task reply {tid} \"<your answers>\" "
+                    "(agy keeps only the ones that still stand), or change your plan")
+        return "no objections stood: carry on"
+    if state == "done" and role == "answers":
+        task = st.get("guard") or "<task>"
+        return f"back to the task: agy-task accept|fix|recommend {task}  ·  more questions: agy-task reply {tid} \"...\""
+    if state == "done":
+        return f"follow up if needed: agy-task reply {tid} \"...\""
     return ""
 
 
 def render(t, st):
-    """The short result Claude reads: state, gates, incidents, files and agy's report."""
+    """The short result Claude reads: state, gates, audit, files and agy's report."""
     tid, usage, report = t["id"], st.get("usage", {}), st.get("report") or {}
     out = [f"# {tid} · {t['role']} · {st['state'].upper()}" + (f" ({st['reason']})" if st["reason"] else ""),
            t["title"],
@@ -1093,9 +1279,11 @@ def render(t, st):
     if st["state"] == "failed" and st.get("verify_tail"):
         out.append("tail of the failed verification:")
         out += [f"  | {line}" for line in st["verify_tail"].splitlines()[-12:]]
-    if st["incidents"]:
-        out.append(f"incidents ({len(st['incidents'])}):")
-        out += [f"  - attempt {i['attempt']}: {i['kind']}: {i['path']}" for i in st["incidents"][:15]]
+    notes = all_notes(st)
+    if notes:
+        label = "audit" if st.get("mode") == "collaborative" else "incidents"
+        out.append(f"{label} ({len(notes)}):")
+        out += [f"  - attempt {i['attempt']}: {i['kind']}: {i['path']}" for i in notes[:15]]
     if st.get("files"):
         out.append(f"files ({len(st['files'])}, {st.get('diff_lines', 0)} lines):")
         out += [f"  {f['status']} {f['path']} (+{f['added']} −{f['deleted']})" for f in st["files"][:40]]
@@ -1103,7 +1291,11 @@ def render(t, st):
         out.append(f"verdict: {report['verdict']}")
     if report.get("summary"):
         out.append(f"agy summary: {report['summary'].strip()}")
-    for key, label in (("decisions", "agy decisions"), ("questions", "agy questions")):
+    if isinstance(report.get("suggestion"), dict):
+        s = report["suggestion"]
+        out.append(f"suggestion: {s.get('decision', '?')} — {str(s.get('reason', '')).strip()}")
+    for key, label in (("decisions", "agy decisions"), ("questions", "agy questions"),
+                       ("recommendations", "agy recommendations")):
         if report.get(key):
             out.append(f"{label}:")
             out += [f"  - {item}" for item in report[key][:15]]
@@ -1114,6 +1306,21 @@ def render(t, st):
                 where = item.get("path", "") + (f":{item['line']}" if item.get("line") else "")
                 severity = f"[{item['severity']}] " if item.get("severity") else ""
                 out.append(f"  - {severity}{where} — {item.get('note', '')}")
+    if report.get("objections"):
+        out.append(f"objections ({len(report['objections'])}):")
+        for o in report["objections"][:30]:
+            where = o.get("path", "") + (f":{o['line']}" if o.get("line") else "")
+            out.append(f"  - [{o.get('severity', '?')}] {o.get('claim', '')} — {o.get('challenge', '')}"
+                       + (f" ({where})" if where else ""))
+            if o.get("evidence"):
+                out.append(f"      evidence: {o['evidence']}")
+    if report.get("answers"):
+        out.append(f"answers ({len(report['answers'])}):")
+        for a in report["answers"][:30]:
+            out.append(f"  - Q: {a.get('question', '')}")
+            out.append(f"    A: {a.get('answer', '')}")
+            if a.get("evidence"):
+                out.append(f"    evidence: {a['evidence']}")
     step = next_step(tid, st)
     if step:
         out.append(f"next: {step}")
@@ -1153,46 +1360,153 @@ def cmd_run(args):
     git(repo, "worktree", "add", "-q", "-b", branch_name(tid), str(wt), base)
     links = link_deps(repo, wt, cfg["link"])
     copy_seeds(repo, wt, rd, t["seed"])
-    st = begin(repo, t, {"base": base, "worktree": str(wt), "branch": branch_name(tid), "links": links,
-                         "seeds": t["seed"], "allowed": t["allowed"], "dirty_base": dirty,
+    st = begin(repo, t, {"mode": cfg["mode"], "base": base, "worktree": str(wt), "branch": branch_name(tid),
+                         "links": links, "seeds": t["seed"], "allowed": t["allowed"], "dirty_base": dirty,
                          "no_baseline": not baseline_ok(repo)})
     if cfg["setup"]:
         setup = run_commands(wt, cfg["setup"], cfg["verify_timeout_min"] * 60, rd / "setup.log", tid)
         if not setup["ok"]:
             st.update(state="failed", reason="setup", detail=f"`{setup['command']}` failed (rc={setup['rc']})")
             finish(repo, t, st)
-    prompt = implement_prompt(t, wt)
+    prompt = implement_prompt(t, wt, cfg["mode"], links)
     (rd / "prompt.txt").write_text(prompt)
     supervise(repo, t, cfg, st, prompt)
     finish(repo, t, st)
 
 
-def cmd_fix(args):
+def continue_task(args, message, verb):
+    """fix and recommend: one more supervised session on an implement task, in agy's conversation."""
     repo, cfg, t = prepare(args)
     tid = t["id"]
     prev = load_state(repo, tid)
     if t["role"] != "implement":
-        die("fix only applies to implement tasks; for explore/review, edit the manual and use run again.")
+        die(f"{verb} only applies to implement tasks; for explore/review/grill sessions use reply.")
     if is_running(prev):
         die(f"{tid} is running.")
     wt = Path(prev.get("worktree", "/nonexistent"))
     if prev.get("state") not in ("review", "failed", "blocked") or not wt.exists():
-        die(f"{tid} has no work that can be fixed (state: {prev.get('state', 'never run')}). Use run.")
-    ensure_containment(cfg)
+        die(f"{tid} has no work to continue (state: {prev.get('state', 'never run')}). Use run.")
+    mode = prev.get("mode", cfg["mode"])
+    ensure_containment(dict(cfg, mode=mode))
     copy_seeds(repo, wt, run_dir(repo, tid), t["seed"])  # Claude may have updated them
     carried = {k: prev[k] for k in ("base", "worktree", "branch", "links", "allowed", "dirty_base") if k in prev}
-    st = begin(repo, t, {**carried, "seeds": t["seed"], "no_baseline": prev.get("no_baseline", False)})
+    st = begin(repo, t, {**carried, "mode": mode, "seeds": t["seed"], "no_baseline": prev.get("no_baseline", False)})
     usage = prev.get("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0})
     st.update(started=prev.get("started", st["started"]), active_secs=prev.get("active_secs", 0),
               attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
               usage=usage, usage_before=dict(usage))
-    message = ("Message from the supervisor (Claude) about your work on this task:\n\n" + args.message.strip()
-               + "\n\nApply it within the allowed files and deliver the structured report again.")
     conversation = prev.get("conversation_id")
-    if not conversation:  # there was never a conversation: resend the whole manual
-        message = implement_prompt(t, wt) + "\n\n" + message
+    if not conversation:  # there was never a conversation: resend the whole brief
+        message = implement_prompt(t, wt, mode, prev.get("links", [])) + "\n\n" + message
     supervise(repo, t, cfg, st, message, conversation)
     finish(repo, t, st)
+
+
+def cmd_fix(args):
+    continue_task(args, "Message from the senior (Claude) about your work on this task. It is an instruction:\n\n"
+                  + args.message.strip() + "\n\nApply it and deliver the structured report again.", "fix")
+
+
+def cmd_recommend(args):
+    continue_task(args, "Suggestion from the senior (Claude). It is not an order: weigh it on its merits.\n\n"
+                  + args.message.strip()
+                  + "\n\nIf you agree, apply it, verify it, and set `suggestion` to decision \"adopted\" with your "
+                  "reason. If you disagree, leave the code as it is and set `suggestion` to decision \"declined\" "
+                  "with a concrete argument. Either way, deliver the complete structured report again.", "recommend")
+
+
+def grill_task(repo, cfg, tid, questions):
+    """The senior questions the junior about a delivered task, in the junior's own conversation."""
+    st = need_state(repo, tid)
+    if st.get("role") != "implement":
+        die("grill <ID> questions an implement task; to have agy challenge other material use "
+            "--file, --working or --text.")
+    if is_running(st):
+        die(f"{tid} is running.")
+    wt = Path(st.get("worktree", "/nonexistent"))
+    if not wt.exists():
+        die(f"{tid} has no worktree to discuss (state: {st.get('state')}).")
+    t = {"id": next_id(repo, f"{tid}-q", pad=0), "role": "answers", "title": f"Questions about {tid}: {st.get('title', '')}",
+         "risk": "low", "model": st.get("model", cfg["model_implement"]), "max_fixups": 1,
+         "timeout_min": min(cfg["timeout_min"], 15), "guard": tid}
+    message = ("Questions from the senior (Claude) about the work you delivered. Answer them; do not modify any "
+               "file in this turn.\n\n" + questions.strip()
+               + "\n\nFor each question give a direct answer and the evidence behind it: a file and line, a command "
+               "you ran and its output, or your reasoning. If a question reveals a real problem, say so plainly and "
+               "put the fix you propose in `recommendations`.")
+    conversation = st.get("conversation_id")
+    if not conversation:
+        diff = git(wt, "diff", st["base"])
+        message = (f"You implemented task {tid} ({st.get('title', '')}) in this worktree. Its diff:\n"
+                   f"```diff\n{diff}\n```\n\n" + message)
+    consult(repo, cfg, t, message, wt, conversation=conversation)
+
+
+def cmd_grill(args):
+    repo = repo_root()
+    cfg = load_config(repo)
+    sources = [bool(args.file), args.working, bool(args.text)]
+    if args.id:
+        if any(sources):
+            die("grill takes either a task id or --file/--working/--text, not both.")
+        if not args.message:
+            die('usage: agy-task grill <ID> "questions about its work"')
+        return grill_task(repo, cfg, args.id, args.message)
+    if sum(sources) != 1:
+        die("say what agy should challenge: --file PATH, --working or --text \"...\" (or give a task id).")
+    if args.file:
+        path = Path(args.file).expanduser()
+        path = path if path.is_absolute() else Path.cwd() / path
+        if not path.is_file():
+            die(f"{args.file} is not a file.")
+        shown = path.resolve().relative_to(repo) if path.resolve().is_relative_to(repo) else path.name
+        title, material = f"file {shown}", path.read_text(errors="replace")
+    elif args.working:
+        diff = git(repo, "diff", "HEAD", "--", ".", ":(exclude).agy")
+        new = git(repo, "ls-files", "--others", "--exclude-standard", "--", ".", ":(exclude).agy").strip()
+        if not diff.strip() and not new:
+            die("there are no uncommitted changes to challenge.")
+        title = "the senior's uncommitted changes"
+        material = ("```diff\n" + diff + "\n```" if diff.strip() else "") + (
+            f"\n\nNew untracked files (read them from disk):\n{new}" if new else "")
+    else:
+        title, material = "a statement from the senior", args.text.strip()
+    gid = args.name or next_id(repo, "G-")
+    if not ID_RE.match(gid):
+        die(f"invalid id: {gid!r}")
+    t = {"id": gid, "role": "grill", "title": f"Grill of {title}", "risk": "low", "model": cfg["model_grill"],
+         "max_fixups": 1, "timeout_min": min(cfg["timeout_min"], 15)}
+    focus = args.focus.strip() or "Anything that could make this wrong, incomplete, or a worse choice than an alternative."
+    prompt = join_parts([rules(cfg["mode"], "grill"), f"## Material to challenge — {title}", material,
+                         "## What the senior wants you to focus on", focus])
+    if len(prompt.encode()) > PROMPT_LIMIT:
+        die("the material is too large for one grill (>60 KB): narrow it down.")
+    consult(repo, cfg, t, prompt, repo)
+
+
+def cmd_reply(args):
+    repo = repo_root()
+    cfg = load_config(repo)
+    st = need_state(repo, args.id)
+    if st.get("role") == "implement":
+        die("for implement tasks use fix (an instruction) or recommend (a suggestion).")
+    if is_running(st):
+        die(f"{args.id} is running.")
+    if st.get("state") not in ("done", "blocked") or not st.get("conversation_id"):
+        die(f"{args.id} has no conversation to continue (state: {st.get('state')}).")
+    cwd = Path(st.get("cwd") or repo)
+    if not cwd.exists():
+        die(f"{args.id} worked in {cwd}, which no longer exists.")
+    t = {"id": st["id"], "role": st["role"], "title": st.get("title", ""), "risk": st.get("risk", "low"),
+         "model": st["model"], "max_fixups": 1, "timeout_min": min(cfg["timeout_min"], 15),
+         "guard": st.get("guard", ""), "target": st.get("target", "")}
+    message = ("Reply from the senior (Claude):\n\n" + args.message.strip()
+               + "\n\nTake it into account and deliver the complete structured report again; it replaces your "
+               "previous one.")
+    if st["role"] == "grill":
+        message += (" Keep only the objections that still stand after this reply, and say in `summary` which ones "
+                    "you dropped and why.")
+    consult(repo, cfg, t, message, cwd, conversation=st["conversation_id"], prev=st)
 
 
 def cmd_diff(args):
@@ -1213,7 +1527,7 @@ def cmd_accept(args):
     if st.get("state") != "review":
         die(f"only a task in the review state can be accepted (current: {st.get('state')}).")
     if st.get("review_level") == "diff" and not args.reviewed:
-        die(f"this task requires reading the diff (risk {st.get('risk')}, incidents: {len(st.get('incidents', []))}). "
+        die(f"this task requires reading the diff (risk {st.get('risk')}, audit notes: {len(all_notes(st))}). "
             f"Run `agy-task diff {tid}`, review it and repeat with --reviewed.")
     # Integrated as an atomic patch on the index and the working tree: it applies completely or
     # touches nothing. It only requires the task's files to have no local changes, so several
@@ -1303,8 +1617,8 @@ def cmd_stats(args):
         return sum(r.get(key, 0) for r in subset)
 
     print(f"sessions: {len(rows)} · time: {fmt_secs(total('secs'))} (agy: {fmt_secs(total('agy_secs'))}) · "
-          f"agy tokens: {total('input')} in / {total('output')} out · incidents: {total('incidents')}")
-    for role in ROLES:
+          f"agy tokens: {total('input')} in / {total('output')} out · audit notes: {total('incidents')}")
+    for role in ALL_ROLES:
         subset = [r for r in rows if r.get("role") == role]
         if not subset:
             continue
@@ -1318,7 +1632,7 @@ def cmd_stats(args):
 
 def cmd_check(args):
     repo, cfg, t = prepare(args)
-    print(f"{t['id']}: valid manual · role={t['role']} risk={t['risk']} model={t['model']}")
+    print(f"{t['id']}: valid manual · role={t['role']} risk={t['risk']} model={t['model']} mode={cfg['mode']}")
     if t["role"] != "implement":
         return
     print(f"  allowed: {t['allowed']}\n  protected: {t['protected']}\n  verify: {t['verify']}")
@@ -1416,31 +1730,34 @@ def cmd_doctor(args):
     line(bool(version), f"agy installed: {version or 'not found'}")
     line(bool(shutil.which("git")), "git available")
     line(sys.version_info >= (3, 11), f"python {sys.version.split()[0]}")
-    for kind, names in (("rules", ROLES), ("templates", (*ROLES, "config"))):
-        missing = [n for n in names if not any((BRIDGE / kind).glob(f"{n}.*"))]
-        line(not missing, f"{kind}/ complete" + (f" (missing: {', '.join(missing)})" if missing else ""))
+    for mode, roles in (("collaborative", (*ROLES, "grill")), ("strict", ROLES)):
+        missing = [r for r in roles if not (BRIDGE / "rules" / mode / f"{r}.md").exists()]
+        line(not missing, f"rules/{mode}/ complete" + (f" (missing: {', '.join(missing)})" if missing else ""))
+    missing = [n for n in (*ROLES, "config") if not any((BRIDGE / "templates").glob(f"{n}.*"))]
+    line(not missing, "templates/ complete" + (f" (missing: {', '.join(missing)})" if missing else ""))
     if not ok:
         sys.exit(1)
     if not args.probe:
         record = read_json(HOME / "containment.json")
         if record.get("agy_version") == version and record.get("ok"):
-            print(f"✓ containment verified for agy {version} "
+            print(f"✓ strict-mode containment verified for agy {version} "
                   f"({time.strftime('%Y-%m-%d', time.localtime(record.get('ts', 0)))})")
         else:
-            print(f"· containment not yet verified for agy {version}: it will be probed automatically before the "
-                  "first task (or run `agy-task doctor --probe`).")
+            print(f"· strict-mode containment not yet verified for agy {version}: it is probed automatically "
+                  "before the first strict task (or run `agy-task doctor --probe`). Collaborative mode does not "
+                  "need it.")
         return
     results = probe_containment([PROBE_MODEL, DEFAULTS["model_implement"]])  # uses a little quota
     for good, label in results:
         line(good, label)
     record_containment(version, results)
-    print(f"containment verified for agy {version}." if ok else
-          "CONTAINMENT CHECK FAILED: do not delegate until it is resolved (did the agy version change?).")
+    print(f"strict-mode containment verified for agy {version}." if ok else
+          "STRICT-MODE CONTAINMENT FAILED: do not use strict mode until it is resolved (did the agy version change?).")
     sys.exit(0 if ok else 1)
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="agy-task", description="Supervised executor of agy tasks for Claude Code.")
+    ap = argparse.ArgumentParser(prog="agy-task", description="Run Antigravity (agy) as Claude Code's teammate.")
     ap.add_argument("--version", action="version", version=f"agy-task {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
 
@@ -1461,7 +1778,21 @@ def main():
     p = add("run", cmd_run, "run the task with agy and apply the gates")
     p.add_argument("--restart", action="store_true", help="discard previous work and start from scratch")
     p.add_argument("--allow-overlap", action="store_true", help="allow scope overlapping another running task")
-    p = add("fix", cmd_fix, "send a correction or answer to agy and run the gates again")
+    p = add("fix", cmd_fix, "send an instruction to agy about an implement task and run the gates again")
+    p.add_argument("message")
+    p = add("recommend", cmd_recommend, "send a non-binding suggestion; agy adopts it or explains why not")
+    p.add_argument("message")
+    p = add("grill", cmd_grill, "interrogate: agy challenges your material, or you question agy about a task",
+            with_id=False)
+    p.add_argument("id", nargs="?", default="", help="implement task to question agy about")
+    p.add_argument("message", nargs="?", default="", help="your questions about that task")
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--file", default="", help="a plan, design or document for agy to challenge")
+    source.add_argument("--working", action="store_true", help="have agy challenge your uncommitted changes")
+    source.add_argument("--text", default="", help="a claim or decision for agy to challenge")
+    p.add_argument("--focus", default="", help="what agy should concentrate on")
+    p.add_argument("--name", default="", help="run id (default: G-001, G-002…)")
+    p = add("reply", cmd_reply, "continue an explore, review or grill conversation")
     p.add_argument("message")
     add("result", cmd_result, "show a task's result")
     p = add("diff", cmd_diff, "show the diff of an implement task")
@@ -1472,11 +1803,11 @@ def main():
     p.add_argument("--keep", action="store_true", help="keep the worktree and the branch")
     p = add("reject", cmd_reject, "discard a task's work")
     p.add_argument("--reason", default="")
-    add("cancel", cmd_cancel, "cancel a running task")
+    add("cancel", cmd_cancel, "cancel a running task or session")
     add("status", cmd_status, "list tasks and their states", with_id=False)
     add("stats", cmd_stats, "summarise time, attempts and usage across runs", with_id=False)
     p = add("doctor", cmd_doctor, "check the installation", with_id=False)
-    p.add_argument("--probe", action="store_true", help="probe agy's containment live (uses quota)")
+    p.add_argument("--probe", action="store_true", help="probe strict-mode containment live (uses quota)")
     args = ap.parse_args()
     args.fn(args)
 
