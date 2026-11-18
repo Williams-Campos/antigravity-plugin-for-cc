@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/Williams-Campos/antigravity-plugin-for-cc/actions/workflows/ci.yml"><img src="https://github.com/Williams-Campos/antigravity-plugin-for-cc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.5.1--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.0--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="python">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license: MIT"></a>
 </p>
@@ -41,6 +41,8 @@ external reviewer that challenges Claude's own plan.
 - **Atomic integration.** `accept` stages the whole change or none of it, and never commits.
 - **Two-way review.** `grill` lets a second model, without Claude's context, challenge Claude's
   plans and changes.
+- **Shared skills.** Team skills such as a coding style reach both agents, so Claude and agy
+  write code by the same rules.
 - **Zero dependencies.** A single Python file and a shell launcher.
 
 ## How it works
@@ -129,7 +131,7 @@ Every report from agy also carries its own `recommendations`.
 | [How it works](docs/how-it-works.md) | Workflow, roles, the life of a task, guarantees, modes, states |
 | [Writing a brief](docs/briefs.md) | Format, sections, header fields, tips |
 | [Command reference](docs/commands.md) | Every command, with examples and exit codes |
-| [Configuration](docs/configuration.md) | `.agy/config.toml`, models, project files |
+| [Configuration](docs/configuration.md) | `.agy/config.toml`, user defaults, team skills, models |
 | [Troubleshooting](docs/troubleshooting.md) | Common problems and known limitations |
 | [Field results](docs/field-results.md) | How it behaved on real projects |
 

@@ -34,3 +34,8 @@ artifacts = []              # e.g. ["**/build/**", "**/.dart_tool/**"]
 # max_diff_lines = 800      # above this, the task requires reading the diff
 # timeout_min = 30          # per agy turn
 # verify_timeout_min = 15   # per verification command
+
+# Team skills: skill names (~/.claude/skills/<name>/SKILL.md) or paths to skill files. Claude loads
+# them, and agy receives them at the start of every session. Usually set once for all projects in
+# ~/.agy-bridge/config.toml; `skills = []` here turns them off for this project.
+# skills = ["ponytail"]

@@ -475,6 +475,51 @@ class Conversations(Base):
         self.assertIn("only one definition", self.cli("reply", "E1", "any other definitions?"))
 
 
+class TeamSkills(Base):
+    """`skills`: the same skill files Claude follows reach agy at the start of every session."""
+
+    SKILL = "---\nname: tidy\ndescription: x\n---\n\n# Tidy\nThe smallest complete change.\n"
+
+    def user_config(self, text):
+        (self.tmp / "home").mkdir(exist_ok=True)
+        (self.tmp / "home" / "config.toml").write_text(text + "\n")
+
+    def test_user_skills_reach_fresh_sessions_only(self):
+        skill = self.tmp / "tidy.md"
+        skill.write_text(self.SKILL)
+        self.user_config(f"skills = ['{skill}']")
+        self.delivered()
+        prompt = self.calls()[0]["argv"][-1]
+        self.assertIn("## Team skills", prompt)
+        self.assertIn("The smallest complete change.", prompt)
+        self.assertNotIn("description: x", prompt)
+        self.plan({"so": DONE})
+        self.cli("fix", "T1", "rename nothing")
+        self.assertNotIn("## Team skills", self.calls()[0]["argv"][-1])
+        self.plan({"so": report(verdict="sound", objections=[])})
+        self.cli("grill", "--text", "add is pure")
+        self.assertIn("The smallest complete change.", self.calls()[0]["argv"][-1])
+
+    def test_named_skill_resolves_to_claude_skills_and_project_can_opt_out(self):
+        home = self.tmp / "user"
+        (home / ".claude" / "skills" / "tidy").mkdir(parents=True)
+        (home / ".claude" / "skills" / "tidy" / "SKILL.md").write_text(self.SKILL)
+        self.env["HOME"] = str(home)
+        self.user_config("skills = ['tidy']")
+        self.assertIn("team skill tidy:", self.cli("doctor"))
+        self.delivered()
+        self.assertIn("### Skill: tidy", self.calls()[0]["argv"][-1])
+        self.config(f"verify = ['''{VERIFY}''']\nskills = []")
+        self.delivered("T2")
+        self.assertNotIn("## Team skills", self.calls()[0]["argv"][-1])
+
+    def test_missing_skill_stops_before_agy(self):
+        self.user_config("skills = ['nope.md']")
+        self.task("T1")
+        self.plan({"so": DONE})
+        self.assertIn("skill 'nope.md' not found", self.cli("run", "T1", code=1))
+
+
 class Strict(Base):
     """The strict mode: no terminal, everything outside scope reverted, containment probed."""
     MODE = "strict"

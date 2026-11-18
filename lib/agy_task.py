@@ -38,7 +38,7 @@ try:
 except ImportError:  # Python < 3.11
     sys.exit("agy-task: requires Python 3.11 or newer (tomllib).")
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 BRIDGE = Path(os.path.realpath(__file__)).parent.parent
 AGY = os.environ.get("AGY_BIN", "agy")
@@ -79,6 +79,7 @@ DEFAULTS = {
     "timeout_min": 30,
     "verify_timeout_min": 15,
     "worktree_root": "",
+    "skills": [],
 }
 LIST_KEYS = ("allowed", "forbidden", "protected", "verify", "search", "seed")
 PATH_KEYS = ("allowed", "forbidden", "protected", "seed")
@@ -322,21 +323,46 @@ def agy_dir(repo):
     return repo / ".agy"
 
 
-def load_config(repo):
+def load_config(repo=None):
+    """Defaults, then the user's ~/.agy-bridge/config.toml, then the project's .agy/config.toml."""
     cfg = dict(DEFAULTS)
-    path = agy_dir(repo) / "config.toml"
-    if path.exists():
+    for path in (HOME / "config.toml", repo and agy_dir(repo) / "config.toml"):
+        if not path or not path.exists():
+            continue
         try:
             data = tomllib.loads(path.read_text())
         except tomllib.TOMLDecodeError as e:
-            die(f"invalid .agy/config.toml: {e}")
+            die(f"invalid {path}: {e}")
         unknown = set(data) - set(DEFAULTS)
         if unknown:
-            die(f".agy/config.toml: unknown keys: {', '.join(sorted(unknown))}")
+            die(f"{path}: unknown keys: {', '.join(sorted(unknown))}")
         cfg.update(data)
     if cfg["mode"] not in MODES:
-        die(f".agy/config.toml: mode must be one of {MODES}")
+        die(f"config: mode must be one of {MODES}")
     return cfg
+
+
+def skill_path(entry):
+    """A skill by name (~/.claude/skills/<name>/SKILL.md, the copy Claude loads) or by file path."""
+    if "/" in entry or entry.endswith(".md"):
+        return Path(entry).expanduser()
+    return Path.home() / ".claude" / "skills" / entry / "SKILL.md"
+
+
+def skills_block(cfg):
+    """The team's skills, sent to agy at the start of every session so both agents work by the same rules."""
+    parts = []
+    for entry in cfg["skills"]:
+        path = skill_path(entry)
+        if not path.is_file():
+            die(f"skill {entry!r} not found at {path}: install it or remove it from `skills`.")
+        body = re.sub(r"\A---\n.*?\n---\n", "", path.read_text(), flags=re.S).strip()
+        parts.append(f"### Skill: {entry}\n{body}")
+    if not parts:
+        return ""
+    return ("## Team skills\nThe senior (Claude) works by these skills too. Apply them to everything you do in "
+            "this session. The brief and the rules above take precedence, and your report keeps its format: put "
+            "any closing notes a skill asks for in your summary.\n\n" + "\n\n".join(parts))
 
 
 def task_path(repo, tid):
@@ -1108,6 +1134,8 @@ def consult(repo, cfg, t, message, cwd, conversation=None, prev=None):
                   attempts=prev.get("attempts", 0), incidents=prev.get("incidents", []),
                   usage=usage, usage_before=dict(usage))
     rd = run_dir(repo, tid)
+    if not conversation:
+        message = join_parts([message, skills_block(cfg)])
     (rd / ("prompt.txt" if prev is None else f"reply-{st['attempts'] + 1}.txt")).write_text(message)
     before = tree_fingerprint(cwd, untracked=not free)
     st.update(state="failed", reason="no_report", detail="agy did not deliver a valid report")
@@ -1368,7 +1396,7 @@ def cmd_run(args):
         if not setup["ok"]:
             st.update(state="failed", reason="setup", detail=f"`{setup['command']}` failed (rc={setup['rc']})")
             finish(repo, t, st)
-    prompt = implement_prompt(t, wt, cfg["mode"], links)
+    prompt = join_parts([implement_prompt(t, wt, cfg["mode"], links), skills_block(cfg)])
     (rd / "prompt.txt").write_text(prompt)
     supervise(repo, t, cfg, st, prompt)
     finish(repo, t, st)
@@ -1397,7 +1425,7 @@ def continue_task(args, message, verb):
               usage=usage, usage_before=dict(usage))
     conversation = prev.get("conversation_id")
     if not conversation:  # there was never a conversation: resend the whole brief
-        message = implement_prompt(t, wt, mode, prev.get("links", [])) + "\n\n" + message
+        message = join_parts([implement_prompt(t, wt, mode, prev.get("links", [])), skills_block(cfg), message])
     supervise(repo, t, cfg, st, message, conversation)
     finish(repo, t, st)
 
@@ -1735,6 +1763,8 @@ def cmd_doctor(args):
         line(not missing, f"rules/{mode}/ complete" + (f" (missing: {', '.join(missing)})" if missing else ""))
     missing = [n for n in (*ROLES, "config") if not any((BRIDGE / "templates").glob(f"{n}.*"))]
     line(not missing, "templates/ complete" + (f" (missing: {', '.join(missing)})" if missing else ""))
+    for entry in load_config()["skills"]:
+        line(skill_path(entry).is_file(), f"team skill {entry}: {skill_path(entry)}")
     if not ok:
         sys.exit(1)
     if not args.probe:
