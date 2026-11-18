@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The project follows
 [semantic versioning](https://semver.org/); while it is below 1.0, minor versions may contain
 breaking changes.
 
+## 0.6.1 — 2026-11-18
+
+Fixes from a field report on a Flutter project with a gitignored SDK folder.
+
+### Fixed
+- **Gitignored `link` and `artifacts` paths no longer abort the delivery.** Staging used exclude
+  pathspecs, and git refuses an exclude that names a path it already ignores (`.tooling/`,
+  `node_modules`), so the task ended with exit 4 after agy had finished. Staging now adds
+  everything and then unstages the excluded paths.
+- **An executor failure no longer leaves a task as a dead `running`.** It ends as
+  `failed (executor)`, with the command that failed in `detail` and agy's work kept in the
+  worktree. Sessions whose process died for any other reason read the same way.
+
+### Added
+- `recheck <ID>`: runs the gates again on agy's last delivery without calling agy, after fixing a
+  configuration or executor problem. No more `run --restart` throwing away minutes of agy's work.
+- `baseline` also runs the delivery's staging step, so a `link` or `artifacts` problem shows up
+  before any quota is spent.
+- The result names the files that changed both in the task and in your uncommitted working copy,
+  which `accept` would refuse, instead of a generic note about uncommitted changes.
+
 ## 0.6.0 — 2026-11-18
 
 ### Added

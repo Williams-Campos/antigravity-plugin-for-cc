@@ -86,6 +86,9 @@ class Base(unittest.TestCase):
         self.assertEqual(p.returncode, code, f"rc={p.returncode}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}")
         return p.stdout + p.stderr
 
+    def git_in(self, cwd, *a):
+        return subprocess.run(["git", "-C", str(cwd), *a], capture_output=True, text=True, check=True).stdout
+
     def plan(self, *steps):
         Path(self.env["FAKE_AGY_PLAN"]).write_text(json.dumps(list(steps)))
         calls = Path(self.env["FAKE_AGY_PLAN"] + ".calls")
@@ -473,6 +476,74 @@ class Conversations(Base):
         self.assertIn("agy-task reply E1", self.cli("run", "E1"))
         self.plan({"so": report(findings=[], summary="only one definition")})
         self.assertIn("only one definition", self.cli("reply", "E1", "any other definitions?"))
+
+
+class ExecutorRobustness(Base):
+    """Executor failures leave a closed, recoverable state; ignored paths never break staging."""
+
+    def ignored_tooling(self):
+        (self.repo / ".gitignore").write_text(".tooling/\n")
+        self.git("add", ".gitignore")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "ignore tooling")
+        (self.repo / ".tooling" / "sdk").mkdir(parents=True)
+        (self.repo / ".tooling" / "sdk" / "bin").write_text("sdk\n")
+
+    def test_gitignored_link_and_artifacts_stage_cleanly(self):
+        self.ignored_tooling()
+        self.config("verify = ['test -f src/calc.py']\nlink = ['.tooling/sdk']\nartifacts = ['.tooling/**', 'build/**']")
+        self.assertIn("baseline verification passed", self.cli("baseline"))
+        self.task("T1")
+        self.plan({"write": {"src/calc.py": GOOD, "build/out.txt": "artifact\n"}, "so": DONE})
+        self.cli("run", "T1")
+        st = self.state("T1")
+        self.assertEqual(st["state"], "review")
+        self.assertEqual([f["path"] for f in st["files"]], ["src/calc.py"])
+
+    def test_git_failure_keeps_the_work_and_recheck_recovers_without_agy(self):
+        self.task("T1")
+        self.plan({"write": {"src/calc.py": GOOD}, "so": DONE,
+                   "run": ['touch "$(git rev-parse --git-dir)/index.lock"']})
+        out = self.cli("run", "T1", code=4)
+        self.assertIn("FAILED (executor)", out)
+        self.assertIn("index.lock", out)
+        self.assertIn("agy-task recheck T1", out)
+        st = self.state("T1")
+        self.assertTrue(Path(st["worktree"]).exists())
+        self.assertIn("failed (executor)", self.cli("status"))
+        lock = Path(self.git_in(st["worktree"], "rev-parse", "--git-dir").strip()) / "index.lock"
+        lock.unlink()
+        calls = len(self.calls())
+        out = self.cli("recheck", "T1")
+        self.assertIn("· REVIEW", out)
+        self.assertEqual(len(self.calls()), calls)  # agy was not called again
+        self.cli("accept", "T1")
+        self.assertEqual((self.repo / "src" / "calc.py").read_text(), GOOD)
+
+    def test_recheck_without_a_delivery_is_refused(self):
+        self.task("T1")
+        self.plan({"status": "ERROR", "rc": 1, "stderr": "boom"})
+        self.cli("run", "T1", code=4)
+        self.assertIn("no delivery from agy", self.cli("recheck", "T1", code=1))
+
+    def test_dead_running_session_reads_as_failed_executor(self):
+        self.delivered()
+        path = self.repo / ".agy" / "runs" / "T1" / "state.json"
+        st = json.loads(path.read_text())
+        path.write_text(json.dumps(dict(st, state="running", pid=99999999)))
+        self.assertIn("failed (executor)", self.cli("status"))
+        self.assertIn("· REVIEW", self.cli("recheck", "T1"))
+
+    def test_overlap_with_uncommitted_changes_is_named(self):
+        (self.repo / "src" / "calc.py").write_text("# local edit\n")
+        self.delivered()
+        out = self.cli("result", "T1")
+        self.assertIn("warning: these files also have uncommitted changes in the project", out)
+        self.assertIn("src/calc.py", out)
+        self.cli("accept", "T1", code=3)
+        (self.repo / "README.md").write_text("other local edit\n")
+        self.git("checkout", "--", "src/calc.py")
+        self.delivered("T2")
+        self.assertIn("none of them touch this task's files", self.cli("result", "T2"))
 
 
 class TeamSkills(Base):
