@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/Williams-Campos/antigravity-plugin-for-cc/actions/workflows/ci.yml"><img src="https://github.com/Williams-Campos/antigravity-plugin-for-cc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.6.1--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.7.0--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="python">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license: MIT"></a>
 </p>

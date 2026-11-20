@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The project follows
 [semantic versioning](https://semver.org/); while it is below 1.0, minor versions may contain
 breaking changes.
 
+## 0.7.0 — 2026-11-20
+
+### Changed
+- **Neon is the frontier model.** `model_implement` and `model_grill` default to
+  `gemini-4-neon-high` (previously `gemini-4-argon-high`). Explore and review stay on Hydrogen.
+
+### Added
+- **Quota fallback** (`model_fallback`, default `gemini-4-argon-high`): when the model's quota is
+  exhausted, the same turn is retried once on the fallback model, which has a separate quota, in
+  the same conversation; the session stays on it and the result says so. `model_fallback = ""`
+  turns it off.
+
 ## 0.6.1 — 2026-11-18
 
 Fixes from a field report on a Flutter project with a gitignored SDK folder.

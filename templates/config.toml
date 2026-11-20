@@ -24,10 +24,11 @@ autofix = []                # e.g. ["npx prettier --write src", "dart format lib
 artifacts = []              # e.g. ["**/build/**", "**/.dart_tool/**"]
 
 # agy models per role (names from `agy models`; the suffix is the reasoning effort).
-# model_implement = "gemini-4-argon-high"
+# model_implement = "gemini-4-neon-high"
 # model_explore   = "gemini-4-hydrogen-high"
 # model_review    = "gemini-4-hydrogen-high"   # ideally different from the implementer
-# model_grill     = "gemini-4-argon-high"
+# model_grill     = "gemini-4-neon-high"
+# model_fallback  = "gemini-4-argon-high"     # separate quota: takes over a turn when the model's runs out; "" turns it off
 
 # Default limits.
 # max_fixups = 2            # extra rounds when verification fails, before handing back to Claude

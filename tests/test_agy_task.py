@@ -197,7 +197,7 @@ class Implement(Base):
         self.task("T8")
         self.plan({"status": "ERROR", "rc": 1, "stderr": "RESOURCE_EXHAUSTED: quota exceeded"})
         self.cli("run", "T8", code=10)
-        self.assertEqual(len(self.calls()), 1)  # quota failures are not retried
+        self.assertEqual(len(self.calls()), 2)  # quota: one retry on the fallback model, never a loop
         self.cli("run", "T8", code=1)  # there is previous work: --restart is required
         self.plan({"write": {"src/calc.py": GOOD}, "so": DONE})
         self.cli("run", "T8", "--restart")
@@ -412,7 +412,7 @@ class Conversations(Base):
         self.assertIn("--dangerously-skip-permissions", call["argv"])
         self.assertIn("## Material to challenge — a statement from the senior", call["argv"][-1])
         self.assertIn("side effects", call["argv"][-1])
-        self.assertIn("gemini-4-argon-high", call["argv"])
+        self.assertIn("gemini-4-neon-high", call["argv"])
         self.plan({"so": report(verdict="sound", objections=[], summary="dropped: it is a stub by design")})
         out = self.cli("reply", "G-001", "it is a stub until T1 lands")
         self.assertIn("verdict: sound", out)
@@ -544,6 +544,37 @@ class ExecutorRobustness(Base):
         self.git("checkout", "--", "src/calc.py")
         self.delivered("T2")
         self.assertIn("none of them touch this task's files", self.cli("result", "T2"))
+
+
+class ModelFallback(Base):
+    """Neon by default; when its quota runs out, the same turn moves to Argon (separate quota)."""
+
+    QUOTA = {"status": "ERROR", "rc": 1, "stderr": "RESOURCE_EXHAUSTED: quota exceeded"}
+
+    def model_of(self, call):
+        return call["argv"][call["argv"].index("--model") + 1]
+
+    def test_quota_on_neon_retries_the_turn_on_argon(self):
+        self.task("T1")
+        self.plan(self.QUOTA, {"write": {"src/calc.py": GOOD}, "so": DONE})
+        out = self.cli("run", "T1")
+        self.assertEqual([self.model_of(c) for c in self.calls()], ["gemini-4-neon-high", "gemini-4-argon-high"])
+        self.assertIn("note: gemini-4-neon-high quota exhausted; continued on gemini-4-argon-high.", out)
+        st = self.state("T1")
+        self.assertEqual((st["state"], st["model"], st["attempts"]), ("review", "gemini-4-argon-high", 1))
+
+    def test_quota_on_both_models_fails_as_quota(self):
+        self.task("T1")
+        self.plan(self.QUOTA)
+        self.assertIn("FAILED (quota)", self.cli("run", "T1", code=10))
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_fallback_can_be_turned_off(self):
+        self.config(f"verify = ['''{VERIFY}''']\nmodel_fallback = ''")
+        self.task("T1")
+        self.plan(self.QUOTA)
+        self.cli("run", "T1", code=10)
+        self.assertEqual(len(self.calls()), 1)
 
 
 class TeamSkills(Base):

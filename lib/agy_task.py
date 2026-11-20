@@ -39,7 +39,7 @@ try:
 except ImportError:  # Python < 3.11
     sys.exit("agy-task: requires Python 3.11 or newer (tomllib).")
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 BRIDGE = Path(os.path.realpath(__file__)).parent.parent
 AGY = os.environ.get("AGY_BIN", "agy")
@@ -66,10 +66,11 @@ OPAQUE_NAMES = {".gitkeep", ".DS_Store"}
 
 DEFAULTS = {
     "mode": "collaborative",
-    "model_implement": "gemini-4-argon-high",
+    "model_implement": "gemini-4-neon-high",
     "model_explore": "gemini-4-hydrogen-high",
     "model_review": "gemini-4-hydrogen-high",
-    "model_grill": "gemini-4-argon-high",
+    "model_grill": "gemini-4-neon-high",
+    "model_fallback": "gemini-4-argon-high",  # separate quota: takes over the turn when the model's quota runs out
     "verify": [],
     "link": [],
     "setup": [],
@@ -656,6 +657,18 @@ def call_agy(cwd, prompt, model, perms, schema, timeout_s, out_base, conversatio
             "detail": f"rc={rc} status={env.get('status')}: {detail}"}
 
 
+def call_turn(cfg, t, st, cwd, message, perms, schema, out_base, conversation):
+    """One agy turn with the task's model. If its quota is exhausted, the same turn is retried on
+    `model_fallback`, in the same conversation, and the session stays on that model."""
+    result = call_agy(cwd, message, t["model"], perms, schema, t["timeout_min"] * 60, out_base, conversation)
+    fallback = cfg["model_fallback"]
+    if result["kind"] == "quota" and fallback and fallback != t["model"]:
+        st["fallback"] = f"{t['model']} quota exhausted; continued on {fallback}"
+        t["model"] = st["model"] = fallback
+        result = call_agy(cwd, message, fallback, perms, schema, t["timeout_min"] * 60, out_base, conversation)
+    return result
+
+
 def add_usage(st, result):
     usage = result["env"].get("usage") or {}
     total = st.setdefault("usage", {"input": 0, "output": 0, "cache_read": 0, "agy_secs": 0})
@@ -1053,8 +1066,8 @@ def supervise(repo, t, cfg, st, message, conversation=None):
         n = st["attempts"] = st.get("attempts", 0) + 1
         save_state(repo, st)
         head = git(wt, "rev-parse", "HEAD").strip()
-        result = call_agy(wt, message, t["model"], agy_perms(mode, "implement"), SCHEMAS["implement"],
-                          t["timeout_min"] * 60, rd / f"attempt-{n}", conversation)
+        result = call_turn(cfg, t, st, wt, message, agy_perms(mode, "implement"), SCHEMAS["implement"],
+                           rd / f"attempt-{n}", conversation)
         add_usage(st, result)
         if result["kind"] != "ok":
             st.update(state="failed", reason=result["kind"], detail=result["detail"])
@@ -1167,8 +1180,8 @@ def consult(repo, cfg, t, message, cwd, conversation=None, prev=None):
         st.update(state="failed", reason="no_report", detail="agy did not deliver a valid report")
         for _ in range(1 + t["max_fixups"]):
             n = st["attempts"] = st["attempts"] + 1
-            result = call_agy(cwd, message, t["model"], agy_perms(mode, t["role"]), SCHEMAS[t["role"]],
-                              t["timeout_min"] * 60, rd / f"attempt-{n}", conversation)
+            result = call_turn(cfg, t, st, cwd, message, agy_perms(mode, t["role"]), SCHEMAS[t["role"]],
+                               rd / f"attempt-{n}", conversation)
             add_usage(st, result)
             if result["kind"] != "ok":
                 st.update(state="failed", reason=result["kind"], detail=result["detail"])
@@ -1339,6 +1352,8 @@ def render(t, st):
            f" · agy tokens: {usage.get('input', 0)} in / {usage.get('output', 0)} out"]
     if st["detail"]:
         out.append(f"detail: {st['detail']}")
+    if st.get("fallback"):
+        out.append(f"note: {st['fallback']}.")
     if st.get("overlap"):
         out.append("warning: these files also have uncommitted changes in the project, so `accept` will refuse "
                    "until you commit or discard them there: " + ", ".join(st["overlap"]))

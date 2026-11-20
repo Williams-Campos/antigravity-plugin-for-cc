@@ -21,9 +21,10 @@ autofix = ["ruff format ."]
 | `setup` | `[]` | Commands that prepare the worktree before agy starts, such as `npm ci` |
 | `autofix` | `[]` | Formatters the executor runs after every agy turn |
 | `artifacts` | `[]` | Extra build artifacts kept out of the diff. Python and Node caches already are |
-| `model_implement` | `gemini-4-argon-high` | Implementer |
+| `model_implement` | `gemini-4-neon-high` | Implementer |
 | `model_explore`, `model_review` | `gemini-4-hydrogen-high` | Explorer and reviewer; the reviewer is ideally not the implementer |
-| `model_grill` | `gemini-4-argon-high` | External check of Claude's work |
+| `model_grill` | `gemini-4-neon-high` | External check of Claude's work |
+| `model_fallback` | `gemini-4-argon-high` | Takes over a turn when the model's quota runs out. `""` turns it off |
 | `max_fixups` | `2` | Extra rounds when verification fails, before control goes back to Claude |
 | `max_diff_lines` | `800` | Above this, the task requires reading the diff |
 | `timeout_min` | `30` | Limit per agy turn, in minutes |
@@ -69,8 +70,10 @@ Install a skill for Claude by placing its folder in `~/.claude/skills/`, for exa
 `agy models` lists the models your account can use. The suffix of a model name is its reasoning
 effort (`-low`, `-medium`, `-high`, and `-xhigh` where available).
 
-- **Argon** is thorough: the default for implementing and for challenging Claude's work. Expect
-  minutes per task.
+- **Neon** is the frontier model: the default for implementing and for challenging Claude's work.
+- **Argon** is the fallback. Its quota is separate from Neon's, so when Neon's runs out the same
+  turn is retried on Argon, in the same conversation, and the session stays there. The result says
+  so in a `note:` line. If Argon's quota is exhausted too, the task fails with exit code `10`.
 - **Hydrogen** is quick: the default for exploration and review.
 
 ## Project files
