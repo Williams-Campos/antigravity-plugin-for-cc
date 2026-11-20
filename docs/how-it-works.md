@@ -33,13 +33,14 @@ the bundled skill drives the workflow.
 
 | Role | What agy does | Where it runs | Default model |
 |---|---|---|---|
-| `implement` | Writes code, and its tests, according to the brief | Its own worktree | `gemini-4-argon-high` |
+| `implement` | Writes code, and its tests, according to the brief | Its own worktree | `gemini-4-neon-high` |
 | `explore` | Answers a question about the code, citing path and line | The project, read-only | `gemini-4-hydrogen-high` |
 | `review` | Reviews a task's diff, or the project's uncommitted changes | The task's worktree or the project, read-only | `gemini-4-hydrogen-high` |
-| `grill` | Challenges Claude's plan, changes or claim | The project, read-only | `gemini-4-argon-high` |
+| `grill` | Challenges Claude's plan, changes or claim | The project, read-only | `gemini-4-neon-high` |
 
 The reviewer defaults to a different model than the implementer, so a review is a second opinion
-rather than the same model grading itself.
+rather than the same model grading itself. When a model's quota runs out, the turn continues on
+`gemini-4-argon-high`, which has a separate quota (see [Configuration](configuration.md#choosing-models)).
 
 ## Life of a task
 

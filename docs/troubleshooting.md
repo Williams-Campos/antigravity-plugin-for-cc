@@ -30,6 +30,7 @@ looks wrong.
 - **The worktree starts from the last commit.** Uncommitted changes do not reach agy, except for
   the files listed in `seed`.
 - **Your code is sent to Google** when you delegate. Do not delegate files that contain secrets.
-- **Quota depends on your Google plan.** A quota failure ends the task with exit code `10`.
-- **Argon is thorough, not fast.** Expect minutes per implement task; use Hydrogen for quick
+- **Quota depends on your Google plan.** When the model's quota runs out the turn moves to
+  `model_fallback` (Argon); only when both are exhausted does the task end with exit code `10`.
+- **Implementing takes minutes.** Neon and Argon are thorough, not fast; use Hydrogen for quick
   exploration.
