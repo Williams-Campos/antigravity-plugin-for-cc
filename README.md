@@ -144,7 +144,7 @@ Every report from agy also carries its own `recommendations`.
 
 ## Status
 
-Beta. Tested on macOS with agy 1.5.8 to 1.5.10, on a Flutter project and a NumPy project; the
+Beta. Tested on macOS MacBook Air M1 8GB with agy (antigravity) 1.5.8 to 1.5.10, on a Flutter project and a NumPy project; the
 test suite also runs on Linux. See the [changelog](CHANGELOG.md) for what changed in each release.
 
 ## Contributing
